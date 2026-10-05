@@ -1,77 +1,110 @@
-import { verifyFirebaseToken } from '../config/firebase.js';
-import { supabaseAdmin } from '../config/supabase.js';
-import { unauthorized } from '../utils/response.js';
-
 /**
- * Middleware: Verify Firebase ID token and resolve the user's role from the database.
+ * Authentication: verifies the Firebase ID token (signature, expiry, revocation)
+ * and loads the account from our database. Role comes from the database, never
+ * from the client or token claims.
  *
- * The client must include the Firebase ID token in the Authorization header:
- *   Authorization: Bearer <firebase_id_token>
- *
- * The user's role is determined from the database (checks `providers` table first).
+ *   req.auth  = decoded Firebase token
+ *   req.actor = { id, isPartner, kycStatus, isAdmin }
  */
-export const authenticate = async (req, res, next) => {
+import { verifyIdToken, AuthUnavailableError } from '../config/firebase.js';
+import * as users from '../repos/users.repo.js';
+import { unauthorized, forbidden, unavailable } from '../utils/errors.js';
+
+const ACTOR_TTL_MS = 30 * 1000;
+const actorCache = new Map(); // uid -> { actor, until }
+
+export const invalidateActor = (uid) => actorCache.delete(uid);
+
+const toActor = (row) => ({
+  id: row.id,
+  isPartner: !!row.provider,
+  kycStatus: row.provider?.kyc_status ?? null,
+  isAdmin: !!row.is_admin,
+});
+
+/** Load (cached) actor for a uid; null if the account does not exist yet. */
+export const loadActor = async (uid) => {
+  const hit = actorCache.get(uid);
+  if (hit && hit.until > Date.now()) return hit.actor;
+  const row = await users.findById(uid);
+  if (row && (!row.is_active || row.deleted_at))
+    throw forbidden('This account has been deactivated', 'ACCOUNT_DISABLED');
+  const actor = row ? toActor(row) : null;
+  if (actorCache.size > 10000) actorCache.clear();
+  actorCache.set(uid, { actor, until: Date.now() + ACTOR_TTL_MS });
+  return actor;
+};
+
+export const bearer = (header) => {
+  if (typeof header !== 'string') return null;
+  const m = header.match(/^Bearer\s+([A-Za-z0-9._-]{20,4096})$/);
+  return m ? m[1] : null;
+};
+
+/** Map Firebase Admin errors to API errors. */
+export const tokenError = (err) => {
+  if (err instanceof AuthUnavailableError) return unavailable('Sign-in is temporarily unavailable');
+  switch (err?.code) {
+    case 'auth/id-token-expired':
+      return unauthorized('Your session expired. Please sign in again.', 'TOKEN_EXPIRED');
+    case 'auth/id-token-revoked':
+    case 'auth/user-disabled':
+      return unauthorized('Your session was signed out. Please sign in again.', 'TOKEN_REVOKED');
+    default:
+      return unauthorized('Invalid sign-in token', 'TOKEN_INVALID');
+  }
+};
+
+const verifyHeader = async (req, { fresh = false, allowBody = false } = {}) => {
+  // v1 app versions send the token in the body of /auth/verify-*; v2 uses the header.
+  const fromBody = allowBody && typeof req.body?.idToken === 'string' ? bearer(`Bearer ${req.body.idToken}`) : null;
+  const token = bearer(req.headers.authorization) ?? fromBody;
+  if (!token) throw unauthorized('Missing or malformed Authorization header', 'TOKEN_MISSING');
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader?.startsWith('Bearer ')) {
-      return unauthorized(res, 'Missing or malformed Authorization header');
-    }
+    return await verifyIdToken(token, { fresh });
+  } catch (err) {
+    throw tokenError(err);
+  }
+};
 
-    const token = authHeader.split(' ')[1];
-
-    // Verify Firebase ID token — validates signature, expiry, and issuer
-    let decodedToken;
-    try {
-      decodedToken = await verifyFirebaseToken(token);
-    } catch (err) {
-      if (err.code === 'auth/id-token-expired') {
-        return unauthorized(res, 'Token has expired. Please sign in again.');
-      }
-      if (err.code === 'auth/id-token-revoked') {
-        return unauthorized(res, 'Token has been revoked. Please sign in again.');
-      }
-      return unauthorized(res, 'Invalid or expired token');
-    }
-
-    // Attach Firebase user info to the request
-    req.user = decodedToken;
-    req.userId = decodedToken.uid;
-
-    // Determine role from the database, not from token claims.
-    // Check the `providers` table first; if the user exists there, they are a
-    // provider. Otherwise they are a seeker.
-    const { data: providerRecord } = await supabaseAdmin
-      .from('providers')
-      .select('id')
-      .eq('id', decodedToken.uid)
-      .maybeSingle();
-
-    req.role = providerRecord ? 'provider' : 'seeker';
-
+/** Token only (used by /auth/session, before the account exists). */
+export const verifyToken = async (req, _res, next) => {
+  try {
+    req.auth = await verifyHeader(req, { fresh: true, allowBody: true });
     next();
   } catch (err) {
-    return unauthorized(res, 'Authentication failed');
+    next(err);
   }
 };
 
-/**
- * Middleware: Only allow requests from Seekers.
- * Must be used AFTER authenticate.
- */
-export const seekerOnly = (req, res, next) => {
-  if (req.role !== 'seeker') {
-    return res.status(403).json({ success: false, message: 'Access restricted to Seekers only' });
+/** Token + existing account. */
+export const authenticate = async (req, _res, next) => {
+  try {
+    req.auth = await verifyHeader(req);
+    let actor;
+    try {
+      actor = await loadActor(req.auth.uid);
+    } catch (err) {
+      // Audit BE-X11: a database hiccup is "try again", never "you are someone else".
+      if (err?.status) throw err;
+      throw unavailable('We could not load your account. Please try again.');
+    }
+    if (!actor) throw unauthorized('Finish signing in first', 'ACCOUNT_NOT_FOUND');
+    req.actor = actor;
+    next();
+  } catch (err) {
+    next(err);
   }
-  next();
 };
 
-/**
- * Middleware: Only allow requests from Providers.
- * Must be used AFTER authenticate.
- */
-export const providerOnly = (req, res, next) => {
-  if (req.role !== 'provider') {
-    return res.status(403).json({ success: false, message: 'Access restricted to Providers only' });
-  }
-  next();
-};
+export const requirePartner = (req, _res, next) =>
+  next(req.actor?.isPartner ? undefined : forbidden('Only SerWish partners can do this', 'PARTNER_ONLY'));
+
+export const requireApprovedPartner = (req, _res, next) =>
+  next(
+    req.actor?.isPartner && req.actor.kycStatus === 'approved'
+      ? undefined
+      : forbidden('Your KYC must be approved first', 'KYC_NOT_APPROVED'),
+  );
+
+export const requireAdmin = (req, _res, next) => next(req.actor?.isAdmin ? undefined : forbidden());

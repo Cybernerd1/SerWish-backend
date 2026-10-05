@@ -1,65 +1,28 @@
 import { Router } from 'express';
-import {
-  verifyPhone,
-  verifyEmail,
-  googleAuth,
-  logout,
-} from '../controllers/auth.controller.js';
+import { z } from 'zod';
+import { createSession, logout } from '../controllers/auth.controller.js';
+import { authenticate, verifyToken } from '../middleware/auth.js';
 import { authLimiter } from '../middleware/rateLimiter.js';
-import { validate } from '../middleware/validate.js';
-import { authenticate } from '../middleware/auth.js';
-import { body } from 'express-validator';
+import { validate } from '../utils/validators.js';
+import { asyncHandler } from '../utils/response.js';
 
 const router = Router();
 
-// ─── Firebase ID Token Validation ─────────────────────────────────────────────
-const idTokenValidation = body('idToken')
-  .notEmpty()
-  .withMessage('idToken is required')
-  .isString()
-  .withMessage('idToken must be a string');
+const sessionBody = z
+  .object({
+    role: z.enum(['customer', 'partner', 'seeker', 'provider']).optional(),
+    idToken: z.string().max(4096).optional(), // v1 apps only; v2 sends Authorization: Bearer
+  })
+  .strict();
 
-// ─── Phone Auth ───────────────────────────────────────────────────────────────
-// Client handles OTP send/verify via Firebase Auth SDK, then sends the
-// resulting ID token here for backend verification + user upsert.
-router.post(
-  '/verify-phone',
-  authLimiter,
-  [idTokenValidation],
-  validate,
-  verifyPhone
-);
+const session = [authLimiter, validate({ body: sessionBody }), verifyToken, asyncHandler(createSession)];
 
-// ─── Email Auth ───────────────────────────────────────────────────────────────
-// Client handles email OTP/link via Firebase Auth SDK, then sends the
-// resulting ID token here for backend verification + user upsert.
-router.post(
-  '/verify-email',
-  authLimiter,
-  [idTokenValidation],
-  validate,
-  verifyEmail
-);
+router.post('/session', ...session);
+// v1 aliases kept so installed test builds keep working.
+router.post('/verify-phone', ...session);
+router.post('/verify-email', ...session);
+router.post('/google', ...session);
 
-// ─── Google Auth ──────────────────────────────────────────────────────────────
-// Client signs in with Google via Firebase Auth SDK, then sends the
-// resulting ID token here.
-router.post(
-  '/google',
-  authLimiter,
-  [
-    idTokenValidation,
-    body('role')
-      .optional()
-      .isIn(['seeker', 'provider'])
-      .withMessage('role must be "seeker" or "provider"'),
-  ],
-  validate,
-  googleAuth
-);
-
-// ─── Logout ───────────────────────────────────────────────────────────────────
-// Revokes all Firebase refresh tokens for the user.
-router.post('/logout', authenticate, logout);
+router.post('/logout', authenticate, asyncHandler(logout));
 
 export default router;

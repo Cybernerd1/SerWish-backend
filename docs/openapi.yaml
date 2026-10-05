@@ -1,0 +1,957 @@
+openapi: 3.1.0
+info:
+  title: SerWish API
+  version: 2.1.0
+  description: |
+    API for the SerWish customer and partner apps.
+
+    **Envelope.** Every JSON response is `{ success, message, data?, meta? }` on success and
+    `{ success: false, code, message, errors?, data? }` on failure. `errors` lists `{ field, message }`
+    for `VALIDATION_FAILED`; `data` carries context such as the fresh estimate for `PRICE_CHANGED`.
+
+    **Auth.** Sign in with Firebase in the app (Google first; phone OTP; email and password for
+    Play Store testers), then send the Firebase ID token as `Authorization: Bearer <token>`.
+    Call `POST /auth/session` once after each sign-in.
+
+    **Status.** `x-status: live` endpoints work today. `phase-5` (online payments) and `phase-6`
+    (KYC upload, earnings) endpoints answer `501 NOT_IMPLEMENTED` until that backend phase ships.
+
+    **Money** is whole rupees (integers). **Times** are ISO 8601 UTC.
+servers:
+  - url: http://localhost:5000/api/v1
+    description: Local
+  - url: https://api.serwish.in/api/v1
+    description: Production (planned)
+security:
+  - firebase: []
+tags:
+  - name: Auth
+  - name: Account
+  - name: Catalogue
+  - name: Partners
+  - name: Bookings
+  - name: Payments
+  - name: Partner tools
+
+paths:
+  /auth/session:
+    post:
+      tags: [Auth]
+      x-status: live
+      summary: Create or refresh the account after a Firebase sign-in
+      description: |
+        Verifies the token (including revocation), creates the user on first sign-in, and refreshes
+        the phone/email Firebase vouches for. Never overwrites a name or photo set in the app.
+        `role: partner` (from the partner app) also starts a partner profile with KYC `not_started`.
+        Aliases kept for v1 builds: `/auth/verify-phone`, `/auth/verify-email`, `/auth/google`
+        (these also accept `idToken` in the body).
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                role: { type: string, enum: [customer, partner, seeker, provider] }
+      responses:
+        '200':
+          description: Signed in
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Ok'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          firebaseUid: { type: string }
+                          isNewUser: { type: boolean, description: True until the user has a name (show profile onboarding) }
+                          user: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '409':
+          description: '`ACCOUNT_CONFLICT`: the phone or email is linked to another account'
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /auth/logout:
+    post:
+      tags: [Auth]
+      x-status: live
+      summary: Sign out on every device (revokes Firebase refresh tokens)
+      responses:
+        '200': { $ref: '#/components/responses/OkEmpty' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /users/me:
+    get:
+      tags: [Account]
+      x-status: live
+      summary: Current account
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { $ref: '#/components/schemas/User' } } }] } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { description: '`ACCOUNT_DISABLED`', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    patch:
+      tags: [Account]
+      x-status: live
+      summary: Update profile (alias PATCH /users/profile)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                name: { type: string, minLength: 2, maxLength: 80 }
+                email: { type: string, format: email }
+                city: { type: string, minLength: 2, maxLength: 60 }
+                photoUrl: { type: [string, 'null'], format: uri, description: https only }
+      responses:
+        '200':
+          description: Updated
+          content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { $ref: '#/components/schemas/User' } } }] } } }
+        '409': { description: '`DUPLICATE` email already used', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { $ref: '#/components/responses/Invalid' }
+    delete:
+      tags: [Account]
+      x-status: live
+      summary: Delete my account (Play Store requirement)
+      description: Anonymises personal fields, deactivates the account and signs out everywhere. Booking history stays for partners and accounting.
+      responses:
+        '204': { description: Deleted }
+
+  /users/addresses:
+    get:
+      tags: [Account]
+      x-status: live
+      summary: Saved addresses (default first)
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { type: array, items: { $ref: '#/components/schemas/Address' } } } }] } } }
+    post:
+      tags: [Account]
+      x-status: live
+      summary: Save an address (max 10). The first one becomes the default.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/AddressInput' } } }
+      responses:
+        '201':
+          description: Saved
+          content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { $ref: '#/components/schemas/Address' } } }] } } }
+        '409': { description: '`LIMIT_REACHED`', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { $ref: '#/components/responses/Invalid' }
+  /users/addresses/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    patch:
+      tags: [Account]
+      x-status: live
+      summary: Edit an address (send lat and lng together; isDefault=true moves the default)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/AddressInput' } } }
+      responses:
+        '200': { description: Updated }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Account]
+      x-status: live
+      summary: Remove an address (another one is promoted to default)
+      responses:
+        '204': { description: Removed }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /config:
+    get:
+      tags: [Catalogue]
+      x-status: live
+      security: []
+      summary: Marketplace rules the app should not hard-code
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Ok'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          matchRadiusKm: { type: number, example: 5 }
+                          jobOfferSeconds: { type: integer, example: 45 }
+                          platformFee: { type: integer, example: 0 }
+                          cancellationFee: { type: integer, example: 0 }
+                          walletEnabled: { type: boolean, example: false }
+                          features: { type: object, properties: { bookings: { type: boolean }, payments: { type: boolean } } }
+                          paymentMethods: { type: array, items: { type: string, enum: [upi, card, netbanking, cash] } }
+  /categories:
+    get:
+      tags: [Catalogue]
+      x-status: live
+      security: []
+      summary: All categories in display order (alias GET /services/categories)
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { type: array, items: { $ref: '#/components/schemas/Category' } } } }] } } }
+  /categories/{idOrSlug}:
+    get:
+      tags: [Catalogue]
+      x-status: live
+      security: []
+      summary: One category with its services, plus top partners nearby when lat/lng are sent (alias GET /services/categories/{idOrSlug})
+      parameters:
+        - { $ref: '#/components/parameters/IdOrSlug' }
+        - { name: lat, in: query, schema: { type: number } }
+        - { name: lng, in: query, schema: { type: number } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Ok'
+                  - properties:
+                      data:
+                        allOf:
+                          - $ref: '#/components/schemas/Category'
+                          - properties: { services: { type: array, items: { $ref: '#/components/schemas/Service' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /services:
+    get:
+      tags: [Catalogue]
+      x-status: live
+      security: []
+      summary: Search and list services
+      parameters:
+        - { name: category, in: query, schema: { type: string }, description: Category id or slug }
+        - { name: q, in: query, schema: { type: string, maxLength: 60 }, description: Matches name or subtitle }
+        - { name: sort, in: query, schema: { type: string, enum: [popular, price_asc, price_desc, rating], default: popular } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+      responses:
+        '200':
+          description: OK (meta.total = total matches)
+          content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { type: array, items: { $ref: '#/components/schemas/Service' } }, meta: { $ref: '#/components/schemas/PageMeta' } } }] } } }
+  /services/{idOrSlug}:
+    get:
+      tags: [Catalogue]
+      x-status: live
+      security: []
+      summary: Service detail with packages and extras
+      parameters: [{ $ref: '#/components/parameters/IdOrSlug' }]
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { $ref: '#/components/schemas/Service' } } }] } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /offers:
+    get:
+      tags: [Catalogue]
+      x-status: live
+      security: []
+      summary: Active coupon offers
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { type: array, items: { $ref: '#/components/schemas/Offer' } } } }] } } }
+
+  /services/popular:
+    get:
+      tags: [Catalogue]
+      x-status: live
+      security: []
+      summary: Most booked services (Home screen)
+      parameters: [{ name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 20, default: 8 } }]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { type: array, items: { $ref: '#/components/schemas/Service' } } } }] } } } }
+  /search:
+    get:
+      tags: [Catalogue]
+      x-status: live
+      security: []
+      summary: Categories and services matching the words
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string, minLength: 1, maxLength: 60 } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 20, default: 10 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Ok'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          query: { type: string }
+                          categories: { type: array, items: { $ref: '#/components/schemas/Category' } }
+                          services: { type: array, items: { $ref: '#/components/schemas/Service' } }
+  /search/suggest:
+    get:
+      tags: [Catalogue]
+      x-status: live
+      security: []
+      summary: Up to 8 labels for the search box as the user types
+      parameters: [{ name: q, in: query, required: true, schema: { type: string, minLength: 1, maxLength: 60 } }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Ok'
+                  - properties:
+                      data:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            type: { type: string, enum: [category, service] }
+                            id: { type: string }
+                            slug: { type: string }
+                            label: { type: string }
+                            subtitle: { type: string }
+
+  /providers:
+    get:
+      tags: [Partners]
+      x-status: live
+      summary: KYC-approved partners near a point (signed-in users only)
+      description: Default radius is the matching radius (5 km); the maximum is twice that.
+      parameters:
+        - { name: lat, in: query, required: true, schema: { type: number, minimum: -90, maximum: 90 } }
+        - { name: lng, in: query, required: true, schema: { type: number, minimum: -180, maximum: 180 } }
+        - { name: radiusKm, in: query, schema: { type: number, minimum: 0.5, maximum: 25 } }
+        - { name: category, in: query, schema: { type: string }, description: Category slug }
+        - { name: serviceId, in: query, schema: { type: string, format: uuid } }
+        - { name: sort, in: query, schema: { type: string, enum: [distance, rating, price], default: distance } }
+        - { name: onlineOnly, in: query, schema: { type: boolean, default: false } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { type: array, items: { $ref: '#/components/schemas/ProviderCard' } } } }] } } }
+        '422': { $ref: '#/components/responses/Invalid' }
+  /providers/{id}:
+    get:
+      tags: [Partners]
+      x-status: live
+      summary: Partner profile with the 5 latest reviews (approved partners only)
+      parameters: [{ $ref: '#/components/parameters/PartnerId' }]
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { $ref: '#/components/schemas/ProviderDetail' } } }] } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /providers/{id}/reviews:
+    get:
+      tags: [Partners]
+      x-status: live
+      summary: Reviews for a partner, newest first
+      parameters: [{ $ref: '#/components/parameters/PartnerId' }, { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Offset' }]
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { type: array, items: { $ref: '#/components/schemas/Review' } }, meta: { $ref: '#/components/schemas/PageMeta' } } }] } } }
+
+  /providers/register:
+    post:
+      tags: [Partner tools]
+      x-status: live
+      summary: Become a partner (Partner Registration screen)
+      description: |
+        Keeps the customer side of the account (roles are never flipped). Phone and email come from the
+        Firebase sign-in. Refused with `409 ALREADY_PARTNER` once KYC is pending, approved or rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name, categorySlugs]
+              properties:
+                name: { type: string, minLength: 2, maxLength: 80 }
+                email: { type: string, format: email }
+                city: { type: string }
+                categorySlugs: { type: array, minItems: 1, maxItems: 5, items: { type: string } }
+                title: { type: string, maxLength: 60, example: Home Cleaning Expert }
+                bio: { type: string, maxLength: 600 }
+                years: { type: integer, minimum: 0, maximum: 60 }
+                languages: { type: array, items: { type: string } }
+                pricePerHour: { type: integer }
+                areas: { type: array, items: { type: string } }
+      responses:
+        '201':
+          description: Registered (KYC not started)
+          content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { $ref: '#/components/schemas/PartnerProfile' } } }] } } }
+        '409': { description: '`ALREADY_PARTNER`', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { $ref: '#/components/responses/Invalid' }
+  /providers/me:
+    get:
+      tags: [Partner tools]
+      x-status: live
+      summary: My partner profile, KYC state and stats
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { $ref: '#/components/schemas/PartnerProfile' } } }] } } }
+        '403': { description: '`PARTNER_ONLY`' }
+    patch:
+      tags: [Partner tools]
+      x-status: live
+      summary: Edit title, bio, languages, rate, service areas and categories (aliases PATCH /providers/profile, POST /providers/skills)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                title: { type: string }
+                bio: { type: string }
+                years: { type: integer }
+                languages: { type: array, items: { type: string } }
+                pricePerHour: { type: integer }
+                areas: { type: array, items: { type: string } }
+                categorySlugs: { type: array, items: { type: string } }
+      responses:
+        '200': { description: Updated }
+        '422': { $ref: '#/components/responses/Invalid' }
+  /providers/kyc:
+    post:
+      tags: [Partner tools]
+      x-status: phase-6
+      summary: Submit ID and certificate (signed upload URLs to the private kyc bucket)
+      responses: { '501': { $ref: '#/components/responses/NotYet' } }
+  /providers/earnings:
+    get:
+      tags: [Partner tools]
+      x-status: phase-6
+      summary: Earnings by day/week with job list
+      responses: { '501': { $ref: '#/components/responses/NotYet' } }
+  /providers/withdraw:
+    post:
+      tags: [Partner tools]
+      x-status: removed
+      security: []
+      summary: Removed (owner decision, no wallet). Always 410.
+      responses: { '410': { description: '`GONE`' } }
+
+  /bookings/estimate:
+    post:
+      tags: [Bookings]
+      x-status: live
+      summary: The exact bill (no surprise charges)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/PriceInput' } } }
+      responses:
+        '200':
+          description: OK. An invalid coupon is reported in `coupon.reason`, not as an error.
+          content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { $ref: '#/components/schemas/Estimate' } } }] } } }
+        '400': { description: Package or add-on not part of the service }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /bookings:
+    post:
+      tags: [Bookings]
+      x-status: live
+      summary: Create a booking (server prices it; starts in `searching`)
+      description: |
+        Requires an `Idempotency-Key` header (8-80 chars); repeating it returns the same booking with 200.
+        `scheduleType: later` needs `scheduledAt` at least 30 minutes and at most 14 days ahead; the
+        dispatcher starts offering it 60 minutes before the slot. Send `expectedTotal` (the estimate's
+        total) to get `409 PRICE_CHANGED` instead of a different price. Card and net banking answer
+        422 until online payments (Phase 5); use `upi` or `cash` (paid to the partner).
+      parameters:
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 8, maxLength: 80 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/PriceInput'
+                - type: object
+                  required: [addressId]
+                  properties:
+                    addressId: { type: string, format: uuid }
+                    scheduleType: { type: string, enum: [now, later], default: now }
+                    scheduledAt: { type: string, format: date-time }
+                    preferredProviderId: { type: string, description: Gets the first 45 s offer }
+                    paymentMethod: { type: string, enum: [upi, cash, card, netbanking], default: upi }
+                    notes: { type: string, maxLength: 500 }
+                    expectedTotal: { type: integer }
+      responses:
+        '201':
+          description: Created
+          content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { $ref: '#/components/schemas/Booking' } } }] } } }
+        '200': { description: 'Same Idempotency-Key: existing booking returned' }
+        '409': { description: '`PRICE_CHANGED` (data.estimate), `COUPON_NOT_APPLICABLE`, `TOO_MANY_ACTIVE` (max 3)' }
+        '422': { $ref: '#/components/responses/Invalid' }
+    get:
+      tags: [Bookings]
+      x-status: live
+      summary: My bookings, as customer (default) or as partner
+      parameters:
+        - { name: as, in: query, schema: { type: string, enum: [customer, partner], default: customer } }
+        - { name: status, in: query, schema: { type: string, enum: [active, completed, cancelled] } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+      responses:
+        '200':
+          description: OK
+          content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { type: array, items: { $ref: '#/components/schemas/Booking' } }, meta: { $ref: '#/components/schemas/PageMeta' } } }] } } }
+  /bookings/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      tags: [Bookings]
+      x-status: live
+      summary: Booking detail with timeline (customer or assigned partner only)
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { $ref: '#/components/schemas/Booking' } } }] } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /bookings/{id}/cancel:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      tags: [Bookings]
+      x-status: live
+      summary: Cancel (customer) or drop out (partner). Never once work has started. No fee.
+      description: |
+        Customer: searching, assigned, en route or arrived -> cancelled. Partner: assigned or en route ->
+        the job goes back to searching and is offered to someone else (`status: released`); arrived ->
+        cancelled. Alias: `DELETE /bookings/{id}`.
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { reason: { type: string, maxLength: 300 } } } } }
+      responses:
+        '200': { description: Cancelled or released }
+        '409': { description: '`RULE_VIOLATION` (already finished, or work started)' }
+  /bookings/{id}/reschedule:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      tags: [Bookings]
+      x-status: live
+      summary: Move a booking nobody has started on (searching or assigned)
+      description: An assigned partner is released and the job is offered again 60 minutes before the new slot. The slot must be 30 minutes to 14 days ahead. No fee.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [scheduledAt], properties: { scheduledAt: { type: string, format: date-time } } } } }
+      responses:
+        '200': { description: Rescheduled (customer view) }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: 'Already on the way, or slot too soon' }
+  /bookings/{id}/start-trip:
+    post:
+      tags: [Bookings]
+      x-status: live
+      summary: Assigned partner starts travelling (en_route)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { '200': { description: OK }, '404': { $ref: '#/components/responses/NotFound' }, '409': { description: Wrong order } }
+  /bookings/{id}/arrive:
+    post:
+      tags: [Bookings]
+      x-status: live
+      summary: Partner is at the address (alias /arrived)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { '200': { description: OK }, '409': { description: Wrong order } }
+  /bookings/{id}/start:
+    post:
+      tags: [Bookings]
+      x-status: live
+      summary: Work started (in_progress); the customer can no longer cancel
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { '200': { description: OK }, '409': { description: Wrong order } }
+  /bookings/{id}/complete:
+    post:
+      tags: [Bookings]
+      x-status: live
+      summary: Complete after receiving the payment (owner decision)
+      description: The partner confirms they received the full total in cash or UPI. Records one payment and credits earnings once. Safe to retry.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [method, amountReceived]
+              properties:
+                method: { type: string, enum: [cash, upi] }
+                amountReceived: { type: integer, description: Must equal the booking total }
+      responses: { '200': { description: Completed }, '409': { description: 'Not started yet, or amount differs from the total' } }
+  /bookings/{id}/review:
+    post:
+      tags: [Bookings]
+      x-status: live
+      summary: Rate a completed booking (optional, once). Alias POST /reviews { bookingId, rating, comment }.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rating]
+              properties:
+                rating: { type: integer, minimum: 1, maximum: 5 }
+                text: { type: string, maxLength: 500 }
+                tags: { type: array, maxItems: 6, items: { type: string } }
+      responses: { '201': { description: Saved }, '409': { description: '`ALREADY_REVIEWED` or not completed yet' } }
+  /bookings/{id}/otp:
+    get:
+      tags: [Bookings]
+      x-status: owner-decision
+      summary: Completion code. Waiting on the owner's decision; answers 501.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { '501': { $ref: '#/components/responses/NotYet' } }
+
+  /job-offers:
+    get:
+      tags: [Bookings]
+      x-status: live
+      summary: My open job offers (for missed socket events). KYC-approved partners only.
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { type: array, items: { $ref: '#/components/schemas/JobOffer' } } } }] } } } }
+        '403': { description: '`KYC_NOT_APPROVED`' }
+  /job-offers/{offerId}:
+    get:
+      tags: [Bookings]
+      x-status: live
+      summary: One job offer
+      parameters: [{ name: offerId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { '200': { description: OK }, '404': { $ref: '#/components/responses/NotFound' } }
+  /job-offers/{offerId}/accept:
+    post:
+      tags: [Bookings]
+      x-status: live
+      summary: Accept (45 s window; first valid accept wins; one active job per partner)
+      parameters: [{ name: offerId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { '200': { description: Assigned (partner view of the booking) }, '404': { $ref: '#/components/responses/NotFound' }, '409': { description: 'Expired, taken, or partner busy' } }
+  /job-offers/{offerId}/reject:
+    post:
+      tags: [Bookings]
+      x-status: live
+      summary: Decline; the next partner gets the offer within ~2 s
+      parameters: [{ name: offerId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { '200': { description: Declined } }
+
+  /notifications:
+    get:
+      tags: [Account]
+      x-status: live
+      summary: My notifications, newest first (meta.unread = unread count)
+      parameters:
+        - { name: unread, in: query, schema: { type: boolean } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { allOf: [{ $ref: '#/components/schemas/Ok' }, { properties: { data: { type: array, items: { $ref: '#/components/schemas/Notification' } } } }] } } } }
+  /notifications/read:
+    post:
+      tags: [Account]
+      x-status: live
+      summary: Mark all (or the given ids) as read
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { ids: { type: array, items: { type: string, format: uuid } } } } } }
+      responses: { '200': { description: OK } }
+
+  /payments/orders:
+    post:
+      tags: [Payments]
+      x-status: phase-5
+      summary: Create a Razorpay order (online payments)
+      responses: { '501': { $ref: '#/components/responses/NotYet' } }
+  /payments/webhook:
+    post:
+      tags: [Payments]
+      x-status: phase-5
+      security: []
+      summary: Razorpay webhook (signature verified)
+      responses: { '501': { $ref: '#/components/responses/NotYet' } }
+
+components:
+  securitySchemes:
+    firebase:
+      type: http
+      scheme: bearer
+      bearerFormat: Firebase ID token
+  parameters:
+    IdOrSlug: { name: idOrSlug, in: path, required: true, schema: { type: string }, description: UUID or slug such as `home-clean` }
+    PartnerId: { name: id, in: path, required: true, schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,128}$' }, description: Partner user id (Firebase UID) }
+    Limit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+    Offset: { name: offset, in: query, schema: { type: integer, minimum: 0, maximum: 10000, default: 0 } }
+  responses:
+    OkEmpty:
+      description: OK
+      content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } }
+    Unauthenticated:
+      description: '`TOKEN_MISSING`, `TOKEN_INVALID`, `TOKEN_EXPIRED`, `TOKEN_REVOKED` or `ACCOUNT_NOT_FOUND` (call /auth/session first)'
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Invalid:
+      description: '`VALIDATION_FAILED`'
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotFound:
+      description: '`NOT_FOUND`'
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    RateLimited:
+      description: '`RATE_LIMITED`'
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotYet:
+      description: '`NOT_IMPLEMENTED` until Backend Phase 3'
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+  schemas:
+    Ok:
+      type: object
+      required: [success, message]
+      properties:
+        success: { const: true }
+        message: { type: string }
+    Error:
+      type: object
+      required: [success, code, message]
+      properties:
+        success: { const: false }
+        code: { type: string, example: VALIDATION_FAILED }
+        message: { type: string }
+        errors: { type: array, items: { type: object, properties: { field: { type: string, example: body.pincode }, message: { type: string } } } }
+    PageMeta:
+      type: object
+      properties: { total: { type: integer }, limit: { type: integer }, offset: { type: integer } }
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: [string, 'null'] }
+        email: { type: [string, 'null'] }
+        phone: { type: [string, 'null'], example: '9876543210' }
+        profilePhotoUrl: { type: [string, 'null'] }
+        city: { type: [string, 'null'] }
+        role: { type: string, enum: [seeker, provider], description: provider when a partner profile exists }
+        isPartner: { type: boolean }
+        kycStatus: { type: [string, 'null'], enum: [not_started, pending, approved, rejected, null] }
+        isAdmin: { type: boolean }
+        createdAt: { type: string, format: date-time }
+    AddressInput:
+      type: object
+      additionalProperties: false
+      required: [line1, city, pincode, lat, lng]
+      properties:
+        label: { type: string, enum: [Home, Work, Other], default: Home }
+        line1: { type: string, minLength: 3, maxLength: 200 }
+        line2: { type: string, maxLength: 200 }
+        city: { type: string }
+        pincode: { type: string, pattern: '^[1-9][0-9]{5}$' }
+        lat: { type: number }
+        lng: { type: number }
+        isDefault: { type: boolean }
+    Address:
+      allOf:
+        - $ref: '#/components/schemas/AddressInput'
+        - type: object
+          properties: { id: { type: string, format: uuid }, isDefault: { type: boolean } }
+    Category:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string, example: cleaning }
+        name: { type: string }
+        icon: { type: string, example: cleaning }
+        group: { type: string, example: Home Care }
+        image: { type: [string, 'null'] }
+        tagline: { type: string }
+        priceFrom: { type: [integer, 'null'], description: Lowest service price in the category }
+    Package:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, example: Standard }
+        price: { type: integer }
+        durationMins: { type: integer }
+        pros: { type: integer, description: Professionals sent }
+        includes: { type: array, items: { type: string } }
+        popular: { type: boolean }
+    Service:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string, example: home-clean }
+        categorySlug: { type: string }
+        name: { type: string }
+        subtitle: { type: string }
+        image: { type: [string, 'null'] }
+        priceFrom: { type: integer }
+        rating: { type: [number, 'null'] }
+        reviewCount: { type: integer }
+        durationMins: { type: integer }
+        description: { type: string }
+        included: { type: array, items: { type: string } }
+        packages: { type: array, items: { $ref: '#/components/schemas/Package' } }
+        extras: { type: array, items: { type: object, properties: { id: { type: string }, name: { type: string }, price: { type: integer } } } }
+    Offer:
+      type: object
+      properties:
+        code: { type: string, example: SERWISH50 }
+        title: { type: string }
+        description: { type: string }
+        kind: { type: string, enum: [percent, flat] }
+        value: { type: integer }
+        maxDiscount: { type: integer }
+        minOrder: { type: integer }
+        categorySlug: { type: [string, 'null'] }
+        validTo: { type: [string, 'null'], format: date-time }
+    ProviderCard:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        title: { type: string, example: Home Cleaning Expert }
+        avatar: { type: [string, 'null'] }
+        rating: { type: [number, 'null'], description: null until the first review }
+        reviewCount: { type: integer }
+        jobs: { type: integer }
+        pricePerHour: { type: [integer, 'null'] }
+        years: { type: integer }
+        online: { type: boolean }
+        distanceKm: { type: number }
+    ProviderDetail:
+      allOf:
+        - $ref: '#/components/schemas/ProviderCard'
+        - type: object
+          properties:
+            languages: { type: array, items: { type: string } }
+            bio: { type: string }
+            areas: { type: array, items: { type: string } }
+            verified: { type: boolean }
+            categorySlugs: { type: array, items: { type: string } }
+            serviceIds: { type: array, items: { type: string, format: uuid } }
+            gallery: { type: array, items: { type: string } }
+            ratingBreakdown: { type: array, items: { type: integer }, minItems: 5, maxItems: 5, description: Percent of reviews for 5..1 stars }
+    Review:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        author: { type: string }
+        avatar: { type: [string, 'null'] }
+        date: { type: string, format: date-time }
+        rating: { type: integer, minimum: 1, maximum: 5 }
+        text: { type: string }
+        tags: { type: array, items: { type: string } }
+        photos: { type: array, items: { type: string } }
+        service: { type: [string, 'null'] }
+    PriceInput:
+      type: object
+      required: [serviceId]
+      properties:
+        serviceId: { type: string, format: uuid }
+        packageId: { type: string, format: uuid }
+        extraIds: { type: array, maxItems: 10, items: { type: string, format: uuid } }
+        couponCode: { type: string, example: CLEAN20 }
+    Estimate:
+      type: object
+      properties:
+        service: { type: object, properties: { id: { type: string }, name: { type: string }, durationMins: { type: integer } } }
+        package: { type: [object, 'null'], properties: { id: { type: string }, name: { type: string }, pros: { type: integer } } }
+        extras: { type: array, items: { type: object, properties: { id: { type: string }, name: { type: string }, price: { type: integer } } } }
+        basePrice: { type: integer }
+        extrasTotal: { type: integer }
+        subtotal: { type: integer }
+        discount: { type: integer }
+        platformFee: { type: integer, example: 0 }
+        total: { type: integer }
+        coupon: { type: [object, 'null'], properties: { code: { type: string }, applied: { type: boolean }, discount: { type: integer }, reason: { type: [string, 'null'] } } }
+        cancellationFee: { type: integer, example: 0 }
+    Booking:
+      type: object
+      description: Customer view has `provider`; partner view has `customer` and `payout` instead.
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, example: SW1A2B3C4D }
+        status: { type: string, enum: [searching, assigned, en_route, arrived, in_progress, completed, cancelled, no_providers] }
+        appStatus: { type: string, enum: [upcoming, ongoing, completed, cancelled], description: The app's booking tabs }
+        service: { type: object, properties: { id: { type: string }, slug: { type: string }, name: { type: string }, image: { type: [string, 'null'] }, durationMins: { type: integer } } }
+        package: { type: [object, 'null'], properties: { id: { type: string }, name: { type: string }, pros: { type: integer } } }
+        extras: { type: array, items: { type: object, properties: { id: { type: string }, name: { type: string }, price: { type: integer } } } }
+        scheduleType: { type: string, enum: [now, later] }
+        asap: { type: boolean }
+        scheduledAt: { type: string, format: date-time }
+        address: { type: object, properties: { id: { type: [string, 'null'] }, text: { type: string }, lat: { type: number }, lng: { type: number } } }
+        notes: { type: [string, 'null'] }
+        price: { type: object, properties: { base: { type: integer }, extras: { type: integer }, discount: { type: integer }, fee: { type: integer }, total: { type: integer } } }
+        couponCode: { type: [string, 'null'] }
+        paymentMethod: { type: string, enum: [upi, card, netbanking, cash] }
+        paymentStatus: { type: string, enum: [pending, paid, failed, refunded] }
+        paid: { type: boolean }
+        cancelledBy: { type: [string, 'null'], enum: [customer, provider, system, admin, null] }
+        cancelReason: { type: [string, 'null'] }
+        timeline: { type: array, items: { type: object, properties: { status: { type: string }, at: { type: [string, 'null'], format: date-time }, done: { type: boolean } } } }
+        review: { type: [object, 'null'], properties: { rating: { type: integer }, text: { type: string }, tags: { type: array, items: { type: string } }, at: { type: string } } }
+        provider: { type: [object, 'null'], properties: { id: { type: string }, name: { type: string }, avatar: { type: [string, 'null'] }, title: { type: string }, rating: { type: [number, 'null'] }, reviewCount: { type: integer }, jobs: { type: integer } } }
+        customer: { type: [object, 'null'], description: Partner view only, properties: { id: { type: string }, name: { type: string }, avatar: { type: [string, 'null'] } } }
+        payout: { type: integer, description: Partner view only (total minus platform fee) }
+        createdAt: { type: string, format: date-time }
+    JobOffer:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        bookingId: { type: string, format: uuid }
+        status: { type: string, enum: [offered, accepted, rejected, expired, cancelled] }
+        serviceId: { type: string }
+        serviceName: { type: string }
+        packageName: { type: [string, 'null'] }
+        image: { type: [string, 'null'] }
+        durationMins: { type: [integer, 'null'] }
+        customerName: { type: string }
+        area: { type: string, description: Locality only; the full address is shown after accepting }
+        distanceKm: { type: number }
+        payout: { type: integer }
+        scheduleType: { type: string }
+        scheduledAt: { type: string, format: date-time }
+        extras: { type: array, items: { type: string } }
+        offeredAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+    Notification:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [booking, offer, update, job] }
+        title: { type: string }
+        body: { type: string }
+        at: { type: string, format: date-time }
+        read: { type: boolean }
+        bookingId: { type: string }
+        icon: { type: string, enum: [check, onTheWay, offer, completed, feature, gift, cancelled] }
+    PartnerProfile:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: [string, 'null'] }
+        email: { type: [string, 'null'] }
+        phone: { type: [string, 'null'] }
+        avatar: { type: [string, 'null'] }
+        city: { type: [string, 'null'] }
+        title: { type: [string, 'null'] }
+        bio: { type: string }
+        years: { type: integer }
+        languages: { type: array, items: { type: string } }
+        pricePerHour: { type: [integer, 'null'] }
+        areas: { type: array, items: { type: string } }
+        categories: { type: array, items: { type: object, properties: { id: { type: string }, slug: { type: string }, name: { type: string } } } }
+        kyc: { type: object, properties: { status: { type: string, enum: [not_started, pending, approved, rejected] }, submittedAt: { type: [string, 'null'] }, reviewedAt: { type: [string, 'null'] }, rejectionReason: { type: [string, 'null'] } } }
+        online: { type: boolean }
+        canGoOnline: { type: boolean }
+        rating: { type: [number, 'null'] }
+        reviewCount: { type: integer }
+        jobs: { type: integer }

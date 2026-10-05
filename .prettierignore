@@ -1,0 +1,8 @@
+node_modules
+logs
+coverage
+package-lock.json
+supabase/**/*.sql
+*.md
+docs/
+ci/

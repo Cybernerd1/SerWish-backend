@@ -1,46 +1,15 @@
+/** Rate limits per client IP (trust proxy is configured in app.js). */
 import rateLimit from 'express-rate-limit';
 
-/**
- * Rate limiter for OTP endpoints.
- * Max 5 OTP requests per hour per IP.
- */
-export const otpLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
-  max: 5,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    success: false,
-    message: 'Too many OTP requests. Please try again after 1 hour.',
-  },
-});
+const make = (windowMs, limit, message) =>
+  rateLimit({
+    windowMs,
+    limit,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { success: false, code: 'RATE_LIMITED', message },
+  });
 
-/**
- * General API rate limiter.
- * Max 200 requests per minute per IP.
- */
-export const apiLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 200,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    success: false,
-    message: 'Too many requests. Please slow down.',
-  },
-});
-
-/**
- * Strict rate limiter for auth endpoints (login, register).
- * Max 20 requests per 15 minutes per IP.
- */
-export const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    success: false,
-    message: 'Too many authentication attempts. Please try again in 15 minutes.',
-  },
-});
+export const apiLimiter = make(60 * 1000, 300, 'Too many requests. Please slow down.');
+export const authLimiter = make(15 * 60 * 1000, 30, 'Too many sign-in attempts. Please try again in a few minutes.');
+export const writeLimiter = make(60 * 1000, 60, 'Too many changes in a short time. Please wait a moment.');

@@ -1,89 +1,52 @@
-import 'dotenv/config';
-import express from 'express';
-import { createServer } from 'http';
-import cors from 'cors';
-import helmet from 'helmet';
-import morgan from 'morgan';
-
+/**
+ * Process entry: validates env (on import), initialises Firebase, starts HTTP
+ * + Socket.IO, and shuts down cleanly on SIGTERM (Render/containers).
+ */
+import { createServer } from 'node:http';
+import { env } from './config/env.js';
+import { initFirebase } from './config/firebase.js';
 import { logger } from './utils/logger.js';
-import { errorHandler } from './middleware/errorHandler.js';
+import { createApp } from './app.js';
 import { initSocket } from './socket/index.js';
-import { apiLimiter } from './middleware/rateLimiter.js';
+import { startDispatcher, stopDispatcher } from './services/dispatcher.js';
 
-// --- Route imports ---
-import authRoutes from './routes/auth.routes.js';
-import userRoutes from './routes/users.routes.js';
-import serviceRoutes from './routes/services.routes.js';
-import providerRoutes from './routes/providers.routes.js';
-import bookingRoutes from './routes/bookings.routes.js';
-import reviewRoutes from './routes/reviews.routes.js';
-import paymentRoutes from './routes/payments.routes.js';
-
-const app = express();
-const httpServer = createServer(app);
-
-// ─── Security Middleware ──────────────────────────────────────────────────────
-app.use(helmet());
-
-// FIX SEC-014: Require ALLOWED_ORIGINS to be explicitly set; fallback to empty
-// array (deny all) rather than '*', preventing unintended open CORS.
-const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',').map((o) => o.trim()).filter(Boolean) || [];
-app.use(
-  cors({
-    origin: allowedOrigins.length > 0 ? allowedOrigins : false,
-    credentials: true,
-  })
-);
-
-// ─── Request Parsing ──────────────────────────────────────────────────────────
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
-// ─── HTTP Logging ─────────────────────────────────────────────────────────────
-app.use(
-  morgan('combined', {
-    stream: { write: (message) => logger.http(message.trim()) },
-  })
-);
-
-// FIX BUG-015: Apply apiLimiter globally to all routes to prevent flooding.
-app.use(apiLimiter);
-
-// ─── Health Check ─────────────────────────────────────────────────────────────
-// FIX SEC-011: Removed env name from health response to prevent info leakage.
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+// Audit BE-C8: never die silently on a stray promise; log and exit for unknown state.
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled promise rejection', { reason: reason instanceof Error ? reason.stack : String(reason) });
+});
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught exception, exiting', { stack: err.stack });
+  process.exit(1);
 });
 
-// ─── API Routes ───────────────────────────────────────────────────────────────
-const API = '/api/v1';
-app.use(`${API}/auth`, authRoutes);
-app.use(`${API}/users`, userRoutes);
-app.use(`${API}/services`, serviceRoutes);
-app.use(`${API}/providers`, providerRoutes);
-app.use(`${API}/bookings`, bookingRoutes);
-app.use(`${API}/reviews`, reviewRoutes);
-app.use(`${API}/payments`, paymentRoutes);
+initFirebase();
 
-// ─── 404 Handler ─────────────────────────────────────────────────────────────
-app.use((_req, res) => {
-  res.status(404).json({ success: false, message: 'Route not found' });
+const app = createApp();
+const server = createServer(app);
+const io = initSocket(server);
+
+server.keepAliveTimeout = 65_000; // above common load balancer idle timeouts
+server.headersTimeout = 66_000;
+
+server.listen(env.PORT, () => {
+  logger.info(`SerWish API listening on :${env.PORT} (${env.NODE_ENV})`);
+  if (env.ENABLE_DISPATCHER) startDispatcher();
 });
 
-// ─── Global Error Handler ────────────────────────────────────────────────────
-app.use(errorHandler);
-
-// ─── Start Server ─────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 5000;
-httpServer.listen(PORT, () => {
-  logger.info(` SerWish backend running on port ${PORT} [${process.env.NODE_ENV || 'production'}]`);
-
-  // FIX BUG-007: Initialize Socket.IO AFTER the server starts listening so
-  // the httpServer is ready before any socket connections are attempted.
-  // Also ensures initSocket() is always called before getIO() can be triggered
-  // by an incoming HTTP request.
-  initSocket(httpServer);
-  logger.info(' Socket.IO initialized after server start');
-});
-
-export default app;
+let closing = false;
+const shutdown = (signal) => {
+  if (closing) return;
+  closing = true;
+  logger.info(`${signal} received, shutting down`);
+  const force = setTimeout(() => process.exit(1), 10_000);
+  force.unref();
+  // Finish the current dispatcher tick, then close sockets and the HTTP server.
+  stopDispatcher().finally(() =>
+    io.close(() => {
+      logger.info('Shutdown complete');
+      process.exit(0);
+    }),
+  );
+};
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

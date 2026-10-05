@@ -1,65 +1,39 @@
-import { logger } from '../utils/logger.js';
+/** 404 + error handler. Never leaks stack traces or database messages in production. */
+import { AppError, fromDbError } from '../utils/errors.js';
+import { logger, redact } from '../utils/logger.js';
+import { isProd } from '../config/env.js';
 
-// Fields that may contain sensitive data and should be redacted from logs
-const SENSITIVE_FIELDS = ['password', 'token', 'otp', 'refreshToken', 'idToken', 'razorpayPaymentId', 'razorpaySignature'];
+export const notFoundHandler = (req, res) =>
+  res.status(404).json({ success: false, code: 'ROUTE_NOT_FOUND', message: 'Route not found' });
 
-/**
- * Recursively redact sensitive keys from an object before logging.
- * FIX SEC-013: Prevents passwords, tokens, and PII from appearing in log files.
- */
-const redactSensitive = (obj) => {
-  if (!obj || typeof obj !== 'object') return obj;
-  return Object.fromEntries(
-    Object.entries(obj).map(([key, value]) => [
-      key,
-      SENSITIVE_FIELDS.includes(key) ? '[REDACTED]' : redactSensitive(value),
-    ])
-  );
-};
+export const errorHandler = (err, req, res, _next) => {
+  // Body parser errors
+  if (err?.type === 'entity.too.large') {
+    return res.status(413).json({ success: false, code: 'PAYLOAD_TOO_LARGE', message: 'Request body is too large' });
+  }
+  if (err?.type === 'entity.parse.failed') {
+    return res.status(400).json({ success: false, code: 'BAD_JSON', message: 'Request body is not valid JSON' });
+  }
 
-/**
- * Global Express error handler.
- * Must be registered LAST with app.use(errorHandler).
- */
-// eslint-disable-next-line no-unused-vars
-export const errorHandler = (err, req, res, next) => {
-  // FIX SEC-013: Redact sensitive fields from the request body before logging
-  logger.error(`[${req.method}] ${req.originalUrl} — ${err.message}`, {
-    stack: err.stack,
-    body: redactSensitive(req.body),
-    params: req.params,
-    query: req.query,
+  const appErr = err instanceof AppError ? err : fromDbError(err?.cause ?? err);
+  if (appErr) {
+    if (appErr.status >= 500) logger.error(appErr.message, { path: req.originalUrl, code: appErr.code });
+    const body = { success: false, code: appErr.code, message: appErr.message };
+    if (Array.isArray(appErr.details)) body.errors = appErr.details;
+    else if (appErr.details) body.data = appErr.details;
+    return res.status(appErr.status).json(body);
+  }
+
+  logger.error(`Unhandled error on ${req.method} ${req.originalUrl}: ${err?.message}`, {
+    requestId: req.id,
+    stack: err?.stack,
+    query: redact(req.query),
+    body: redact(req.body),
   });
-
-  // Handle Supabase / PostgREST errors
-  if (err.code && typeof err.code === 'string' && err.code.startsWith('PGRST')) {
-    return res.status(400).json({
-      success: false,
-      message: 'Database error',
-      detail: err.message,
-    });
-  }
-
-  // Handle JWT errors
-  if (err.name === 'JsonWebTokenError' || err.name === 'TokenExpiredError') {
-    return res.status(401).json({
-      success: false,
-      message: err.name === 'TokenExpiredError' ? 'Token expired' : 'Invalid token',
-    });
-  }
-
-  // Handle multer file size errors
-  if (err.code === 'LIMIT_FILE_SIZE') {
-    return res.status(413).json({ success: false, message: 'File too large (max 10MB)' });
-  }
-
-  // FIX SEC-012: Default NODE_ENV to 'production' to prevent accidental
-  // stack trace leakage when NODE_ENV is not explicitly set.
-  const isProduction = (process.env.NODE_ENV || 'production') !== 'development';
-  const statusCode = err.statusCode || err.status || 500;
-  return res.status(statusCode).json({
+  return res.status(500).json({
     success: false,
-    message: statusCode === 500 ? 'Internal server error' : err.message,
-    ...(!isProduction && { stack: err.stack }),
+    code: 'INTERNAL',
+    message: 'Something went wrong. Please try again.',
+    ...(!isProd && { debug: err?.message }),
   });
 };

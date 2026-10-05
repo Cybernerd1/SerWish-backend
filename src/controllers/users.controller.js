@@ -1,129 +1,51 @@
-import { supabaseAdmin } from '../config/supabase.js';
-import { success, error, notFound } from '../utils/response.js';
-import { logger } from '../utils/logger.js';
+import * as users from '../repos/users.repo.js';
+import * as addresses from '../repos/addresses.repo.js';
+import { revokeSessions } from '../config/firebase.js';
+import { invalidateActor } from '../middleware/auth.js';
+import { toAddress, toUser } from '../utils/dto.js';
+import { created, noContent, ok } from '../utils/response.js';
+import { conflict, notFound } from '../utils/errors.js';
 
-/**
- * GET /api/v1/users/me
- */
-export const getMe = async (req, res, next) => {
-  try {
-    const { data: user, error: dbError } = await supabaseAdmin
-      .from('users')
-      .select('id, phone, email, name, profile_photo_url, rating_avg, total_bookings, wallet_balance, created_at')
-      .eq('id', req.userId)
-      .single();
-
-    if (dbError || !user) return notFound(res, 'User not found');
-
-    return success(res, user);
-  } catch (err) {
-    next(err);
-  }
+export const getMe = async (req, res) => {
+  const row = await users.findById(req.actor.id);
+  if (!row) throw notFound('Account');
+  return ok(res, toUser(row, { providerProfile: row.provider }));
 };
 
-/**
- * PATCH /api/v1/users/profile
- */
-export const updateProfile = async (req, res, next) => {
-  try {
-    const { name, profilePhotoUrl, fcmToken } = req.body;
-
-    const updates = {};
-    if (name !== undefined) updates.name = name;
-    if (profilePhotoUrl !== undefined) updates.profile_photo_url = profilePhotoUrl;
-    if (fcmToken !== undefined) updates.fcm_token = fcmToken;
-    updates.updated_at = new Date().toISOString();
-
-    const { data: user, error: dbError } = await supabaseAdmin
-      .from('users')
-      .update(updates)
-      .eq('id', req.userId)
-      .select()
-      .single();
-
-    if (dbError) return error(res, dbError.message, 400);
-
-    return success(res, user, 'Profile updated');
-  } catch (err) {
-    next(err);
-  }
+export const updateMe = async (req, res) => {
+  const patch = {};
+  if (req.body.name !== undefined) patch.name = req.body.name;
+  if (req.body.city !== undefined) patch.city = req.body.city;
+  if (req.body.photoUrl !== undefined) patch.photo_url = req.body.photoUrl;
+  if (req.body.email !== undefined) patch.email = req.body.email;
+  const row = Object.keys(patch).length
+    ? await users.updateProfile(req.actor.id, patch)
+    : await users.findById(req.actor.id);
+  invalidateActor(req.actor.id);
+  return ok(res, toUser(row, { providerProfile: row.provider }), { message: 'Profile updated' });
 };
 
-/**
- * GET /api/v1/users/addresses
- */
-export const getAddresses = async (req, res, next) => {
-  try {
-    const { data: addresses, error: dbError } = await supabaseAdmin
-      .from('addresses')
-      .select('*')
-      .eq('user_id', req.userId)
-      .order('created_at', { ascending: false });
-
-    if (dbError) return error(res, dbError.message, 400);
-
-    return success(res, addresses || []);
-  } catch (err) {
-    next(err);
-  }
+/** DELETE /users/me - required by Play Store policy. Anonymises and signs out. */
+export const deleteMe = async (req, res) => {
+  await users.softDelete(req.actor.id);
+  invalidateActor(req.actor.id);
+  await revokeSessions(req.actor.id).catch(() => {});
+  return noContent(res);
 };
 
-/**
- * POST /api/v1/users/addresses
- */
-export const addAddress = async (req, res, next) => {
-  try {
-    const { label, lat, lng, fullAddress } = req.body;
+export const listAddresses = async (req, res) => ok(res, (await addresses.listForUser(req.actor.id)).map(toAddress));
 
-    const { data: address, error: dbError } = await supabaseAdmin
-      .from('addresses')
-      .insert({
-        user_id: req.userId,
-        label,
-        lat,
-        lng,
-        full_address: fullAddress,
-      })
-      .select()
-      .single();
-
-    if (dbError) return error(res, dbError.message, 400);
-
-    return success(res, address, 'Address saved', 201);
-  } catch (err) {
-    next(err);
+export const createAddress = async (req, res) => {
+  if ((await addresses.countForUser(req.actor.id)) >= addresses.MAX_ADDRESSES) {
+    throw conflict(`You can save up to ${addresses.MAX_ADDRESSES} addresses`, 'LIMIT_REACHED');
   }
+  return created(res, toAddress(await addresses.create(req.actor.id, req.body)), 'Address saved');
 };
 
-/**
- * DELETE /api/v1/users/addresses/:id
- * FIX BUG-011: Return 404 if the address does not exist or does not belong to
- * this user. Previously returned 200 even for non-existent IDs.
- */
-export const deleteAddress = async (req, res, next) => {
-  try {
-    const { id } = req.params;
+export const updateAddress = async (req, res) =>
+  ok(res, toAddress(await addresses.update(req.actor.id, req.params.id, req.body)), { message: 'Address updated' });
 
-    // First confirm the row exists and belongs to this user
-    const { data: existing, error: findError } = await supabaseAdmin
-      .from('addresses')
-      .select('id')
-      .eq('id', id)
-      .eq('user_id', req.userId)
-      .single();
-
-    if (findError || !existing) return notFound(res, 'Address not found');
-
-    const { error: dbError } = await supabaseAdmin
-      .from('addresses')
-      .delete()
-      .eq('id', id)
-      .eq('user_id', req.userId);
-
-    if (dbError) return error(res, dbError.message, 400);
-
-    return success(res, null, 'Address deleted');
-  } catch (err) {
-    next(err);
-  }
+export const deleteAddress = async (req, res) => {
+  await addresses.remove(req.actor.id, req.params.id);
+  return noContent(res);
 };

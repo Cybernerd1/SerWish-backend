@@ -1,54 +1,18 @@
 /**
- * Standardized API response helpers.
- * Use these in every controller for consistent response shape.
+ * Response envelope used by every endpoint (unchanged from v1 so the app keeps working):
+ *   success: { success: true, message, data?, meta? }
+ *   error:   { success: false, message, code, errors? }
  */
-
-/**
- * Send a success response.
- * @param {import('express').Response} res
- * @param {any} data - Payload to return
- * @param {string} message - Human-readable message
- * @param {number} statusCode - HTTP status code (default 200)
- */
-export const success = (res, data = null, message = 'Success', statusCode = 200) => {
+export const ok = (res, data = null, { message = 'OK', status = 200, meta } = {}) => {
   const body = { success: true, message };
-  if (data !== null) body.data = data;
-  return res.status(statusCode).json(body);
+  if (data !== null && data !== undefined) body.data = data;
+  if (meta) body.meta = meta;
+  return res.status(status).json(body);
 };
 
-/**
- * Send an error response.
- * @param {import('express').Response} res
- * @param {string} message - Error description
- * @param {number} statusCode - HTTP status code (default 400)
- * @param {any} errors - Optional validation errors
- */
-export const error = (res, message = 'Something went wrong', statusCode = 400, errors = null) => {
-  const body = { success: false, message };
-  if (errors) body.errors = errors;
-  return res.status(statusCode).json(body);
-};
+export const created = (res, data, message = 'Created') => ok(res, data, { message, status: 201 });
 
-/**
- * Send a created (201) response.
- */
-export const created = (res, data = null, message = 'Created successfully') =>
-  success(res, data, message, 201);
+export const noContent = (res) => res.status(204).end();
 
-/**
- * Send a not found (404) response.
- */
-export const notFound = (res, message = 'Resource not found') =>
-  error(res, message, 404);
-
-/**
- * Send an unauthorized (401) response.
- */
-export const unauthorized = (res, message = 'Unauthorized') =>
-  error(res, message, 401);
-
-/**
- * Send a forbidden (403) response.
- */
-export const forbidden = (res, message = 'Forbidden') =>
-  error(res, message, 403);
+/** Wrap an async handler so rejections reach the error middleware (audit BE-R1). */
+export const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);

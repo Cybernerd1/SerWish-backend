@@ -1,115 +1,128 @@
-import { supabaseAdmin } from "../config/supabase.js";
-import { SOCKET_EVENTS } from "../config/constants.js";
-import { logger } from "../utils/logger.js";
-
-// In-memory map: providerId → { socketId, currentBookingId }
-// Used to relay location ONLY to the matched seeker
-const providerSocketMap = new Map();
-
 /**
- * Register all location-related Socket.IO events.
- * @param {import('socket.io').Server} io
- * @param {import('socket.io').Socket} socket
+ * Partner presence and live location.
+ *   partner:online  { lat, lng }  -> only KYC-approved partners (rule 4.4)
+ *   partner:offline {}
+ *   partner:location { lat, lng, heading?, speed? } throttled; relayed to the
+ *     customer of the partner's active booking via the booking room.
+ * A dropped connection marks the partner offline after a grace period, unless
+ * they reconnect (mobile networks drop often).
  */
+import { z } from 'zod';
+import { SOCKET_EVENTS, RULES, ACTIVE_BOOKING_STATUSES } from '../config/constants.js';
+import { db } from '../config/supabase.js';
+import * as providers from '../repos/providers.repo.js';
+import { conflict, forbidden, unwrap } from '../utils/errors.js';
+import { kick } from '../services/dispatcher.js';
+import { logger } from '../utils/logger.js';
+import { safeOn } from './safeOn.js';
+
+export const OFFLINE_GRACE_MS = 60_000;
+const point = z.object({ lat: z.number().min(-90).max(90), lng: z.number().min(-180).max(180) });
+const locationPayload = point.extend({
+  heading: z.number().min(0).max(360).optional(),
+  speed: z.number().min(0).max(100).optional(),
+});
+
+const activeBookingFor = async (providerId) =>
+  unwrap(
+    await db()
+      .from('bookings')
+      .select('id, status')
+      .eq('provider_id', providerId)
+      .in('status', ACTIVE_BOOKING_STATUSES)
+      .limit(1)
+      .maybeSingle(),
+  );
+
 export const registerLocationEvents = (io, socket) => {
-  if (socket.userRole !== "provider") return;
+  if (!socket.data.actor.isPartner) return;
+  const uid = socket.data.uid;
+  let lastWrite = 0;
+  let activeBooking = { id: null, status: null, checkedAt: 0 };
 
-  // ─── Provider goes online ─────────────────────────────────────────────────
-  socket.on(SOCKET_EVENTS.GO_ONLINE, async ({ lat, lng }) => {
-    try {
-      await supabaseAdmin
-        .from("providers")
-        .update({
-          is_online: true,
-          current_location: `POINT(${lng} ${lat})`,
-          last_seen_at: new Date().toISOString(),
-        })
-        .eq("id", socket.userId);
+  const requireApproved = async () => {
+    const state = await providers.getPartnerState(uid);
+    if (state?.kyc_status !== 'approved')
+      throw forbidden('Your KYC must be approved before you go online', 'KYC_NOT_APPROVED');
+    return state;
+  };
 
-      // FIX BUG-031: Disconnect stale socket entry if provider reconnects
-      const existing = providerSocketMap.get(socket.userId);
-      if (existing && existing.socketId !== socket.id) {
-        logger.warn(`Provider ${socket.userId} reconnected — stale socket ${existing.socketId} replaced`);
+  safeOn(
+    socket,
+    SOCKET_EVENTS.PARTNER_ONLINE,
+    point,
+    async ({ lat, lng }) => {
+      await requireApproved();
+      await providers.setLocation(uid, lat, lng);
+      const state = await providers.setOnline(uid, true);
+      socket.join('partners:online');
+      io.to(`user:${uid}`).emit(SOCKET_EVENTS.PARTNER_STATE, { online: true });
+      logger.info('Partner online', { uid });
+      kick(); // waiting bookings nearby may now have a match
+      return { online: state.is_online };
+    },
+    { perMinute: 10 },
+  );
+
+  safeOn(
+    socket,
+    SOCKET_EVENTS.PARTNER_OFFLINE,
+    null,
+    async () => {
+      // Edge case: a partner holding a job cannot go offline until it is done.
+      if (await providers.hasActiveJob(uid)) {
+        throw conflict('Finish or release your current job before going offline', 'ACTIVE_JOB');
       }
+      await providers.setOnline(uid, false);
+      socket.leave('partners:online');
+      io.to(`user:${uid}`).emit(SOCKET_EVENTS.PARTNER_STATE, { online: false });
+      return { online: false };
+    },
+    { perMinute: 10 },
+  );
 
-      providerSocketMap.set(socket.userId, {
-        socketId: socket.id,
-        bookingId: null,
-      });
-
-      // Join the online providers room (used for broadcasting new jobs)
-      socket.join("online_providers");
-
-      logger.info(`Provider ${socket.userId} went ONLINE at (${lat}, ${lng})`);
-    } catch (err) {
-      logger.error(`go_online error: ${err.message}`);
-    }
-  });
-
-  // ─── Provider goes offline ────────────────────────────────────────────────
-  socket.on(SOCKET_EVENTS.GO_OFFLINE, async () => {
-    try {
-      await supabaseAdmin
-        .from("providers")
-        .update({ is_online: false })
-        .eq("id", socket.userId);
-
-      providerSocketMap.delete(socket.userId);
-      socket.leave("online_providers");
-
-      logger.info(`Provider ${socket.userId} went OFFLINE`);
-    } catch (err) {
-      logger.error(`go_offline error: ${err.message}`);
-    }
-  });
-
-  // ─── Real-time location update (every 5 seconds) ──────────────────────────
-  socket.on(SOCKET_EVENTS.LOCATION_UPDATE, async ({ lat, lng, bookingId }) => {
-    try {
-      // Update DB with latest coordinates
-      await supabaseAdmin
-        .from("providers")
-        .update({ current_location: `POINT(${lng} ${lat})` })
-        .eq("id", socket.userId);
-
-      // If provider is on an active booking, relay location to the matched seeker ONLY
-      if (bookingId) {
-        const { data: booking } = await supabaseAdmin
-          .from("bookings")
-          .select("seeker_id")
-          .eq("id", bookingId)
-          .eq("provider_id", socket.userId)
-          .single();
-
-        if (booking?.seeker_id) {
-          io.to(`user:${booking.seeker_id}`).emit(
-            SOCKET_EVENTS.PROVIDER_LOCATION,
-            {
-              lat,
-              lng,
-              bookingId,
-              timestamp: Date.now(),
-            }
-          );
-        }
+  safeOn(
+    socket,
+    SOCKET_EVENTS.PARTNER_LOCATION,
+    locationPayload,
+    async ({ lat, lng, heading, speed }) => {
+      const now = Date.now();
+      // Re-check the active booking at most every 5 s.
+      if (now - activeBooking.checkedAt > 5_000) {
+        const active = await activeBookingFor(uid);
+        activeBooking = { id: active?.id ?? null, status: active?.status ?? null, checkedAt: now };
       }
-    } catch (err) {
-      logger.error(`location_update error: ${err.message}`);
-    }
-  });
+      // Privacy: the customer sees the partner only while they travel and on arrival.
+      if (activeBooking.id && (activeBooking.status === 'en_route' || activeBooking.status === 'arrived')) {
+        io.to(`booking:${activeBooking.id}`).emit(SOCKET_EVENTS.BOOKING_LOCATION, {
+          bookingId: activeBooking.id,
+          lat,
+          lng,
+          heading: heading ?? null,
+          speed: speed ?? null,
+          at: new Date(now).toISOString(),
+        });
+      }
+      // Throttle database writes; the relay above stays real time.
+      if (now - lastWrite >= RULES.locationMinIntervalMs) {
+        lastWrite = now;
+        await providers.setLocation(uid, lat, lng);
+      }
+      return undefined;
+    },
+    { perMinute: 120 },
+  );
 
-  // ─── Cleanup on disconnect ───────────────────────────────────────────────
-  socket.on("disconnect", async () => {
-    // FIX BUG-031: Only clean up if this socket is the current registered one
-    // (not if a newer connection replaced it)
-    const entry = providerSocketMap.get(socket.userId);
-    if (entry && entry.socketId === socket.id) {
-      providerSocketMap.delete(socket.userId);
-      await supabaseAdmin
-        .from("providers")
-        .update({ is_online: false })
-        .eq("id", socket.userId)
-        .catch(() => {}); // silent fail on disconnect
-    }
+  socket.on('disconnect', () => {
+    setTimeout(async () => {
+      try {
+        const sockets = await io.in(`user:${uid}`).fetchSockets();
+        if (sockets.some((s) => s.data.actor?.isPartner)) return;
+        await providers.setOnline(uid, false);
+        logger.info('Partner offline after disconnect', { uid });
+      } catch (err) {
+        logger.warn('Could not mark partner offline', { uid, error: err?.message });
+      }
+    }, OFFLINE_GRACE_MS).unref();
   });
 };

@@ -1,3 +1,1 @@
-import { validate } from '../utils/validators.js';
-
-export { validate };
+export { validate } from '../utils/validators.js';

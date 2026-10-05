@@ -1,32 +1,33 @@
-import { Router } from "express";
-import { authenticate } from "../middleware/auth.js";
-import { validate } from "../middleware/validate.js";
-import { ratingValidation, uuidParamValidation } from "../utils/validators.js";
-import { body, query } from "express-validator";
-import { submitReview, getReviews } from "../controllers/reviews.controller.js";
+/** v1 alias: POST /reviews { bookingId, rating, comment }. New apps use POST /bookings/:id/review. */
+import { Router } from 'express';
+import { z } from 'zod';
+import { reviewBooking } from '../controllers/bookings.controller.js';
+import { authenticate } from '../middleware/auth.js';
+import { writeLimiter } from '../middleware/rateLimiter.js';
+import { uuid, validate } from '../utils/validators.js';
+import { asyncHandler } from '../utils/response.js';
 
 const router = Router();
+const body = z
+  .object({
+    bookingId: uuid,
+    rating: z.number().int().min(1).max(5),
+    comment: z.string().trim().max(500).optional(),
+    tags: z.array(z.string().trim().min(1).max(30)).max(6).optional(),
+  })
+  .strict();
 
-// POST /api/v1/reviews
 router.post(
-  "/",
+  '/',
   authenticate,
-  [
-    body("bookingId").isUUID().withMessage("bookingId must be a valid UUID"),
-    ratingValidation,
-    body("comment").optional().trim().isLength({ max: 500 }),
-    body("tags").optional().isArray(),
-  ],
-  validate,
-  submitReview
-);
-
-// GET /api/v1/reviews
-router.get(
-  "/",
-  [query("providerId").optional().isUUID()],
-  validate,
-  getReviews
+  writeLimiter,
+  validate({ body }),
+  (req, _res, next) => {
+    req.params.id = req.body.bookingId;
+    req.body = { rating: req.body.rating, text: req.body.comment, tags: req.body.tags };
+    next();
+  },
+  asyncHandler(reviewBooking),
 );
 
 export default router;

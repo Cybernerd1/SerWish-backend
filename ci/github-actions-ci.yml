@@ -1,0 +1,58 @@
+# Move this file to .github/workflows/ci.yml (remote tools cannot write into .github).
+name: backend-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npx vitest run --exclude "tests/integration/**"
+
+  database-and-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      PGRST_SECRET: serwish-ci-test-secret-at-least-32-chars-long
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Migrations, seed and database rule checks
+        run: bash scripts/db-check.sh
+      - name: Start PostgREST
+        run: |
+          psql "$DATABASE_URL" -q -c "create role authenticator login password 'authenticator' noinherit; grant anon, service_role to authenticator;"
+          curl -sSL https://github.com/PostgREST/postgrest/releases/download/v12.2.3/postgrest-v12.2.3-linux-static-x64.tar.xz | tar xJ
+          PGRST_DB_URI=postgres://authenticator:authenticator@localhost:5432/postgres \
+          PGRST_DB_SCHEMAS=public PGRST_DB_ANON_ROLE=anon PGRST_DB_EXTRA_SEARCH_PATH="public, extensions" \
+          PGRST_JWT_SECRET=$PGRST_SECRET PGRST_SERVER_PORT=54399 ./postgrest > postgrest.log 2>&1 &
+          sleep 3 && tail -3 postgrest.log
+      - run: npm ci
+      - name: Integration tests
+        run: |
+          export TEST_POSTGREST_URL=http://127.0.0.1:54399
+          export TEST_SERVICE_ROLE_JWT=$(node scripts/make-test-jwt.mjs service_role "$PGRST_SECRET")
+          npx vitest run tests/integration

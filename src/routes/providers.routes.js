@@ -1,63 +1,78 @@
 import { Router } from 'express';
-import { authenticate, providerOnly } from '../middleware/auth.js';
-import { validate } from '../middleware/validate.js';
-import { uuidParamValidation } from '../utils/validators.js';
-import { query, body } from 'express-validator';
-import {
-  getNearbyProviders,
-  getProviderById,
-  updateProviderProfile,
-  setProviderSkills,
-  uploadKyc,
-  getEarnings,
-  requestWithdrawal,
-} from '../controllers/providers.controller.js';
+import { z } from 'zod';
+import * as c from '../controllers/providers.controller.js';
+import { authenticate, requirePartner } from '../middleware/auth.js';
+import { writeLimiter } from '../middleware/rateLimiter.js';
+import { notImplemented } from '../utils/errors.js';
+import { firebaseUid, lat, lng, pagination, personName, slug, uuid, validate } from '../utils/validators.js';
+import { asyncHandler } from '../utils/response.js';
 
 const router = Router();
-
-// ─── Public routes ────────────────────────────────────────────────────────────
-// Public: GET /api/v1/providers
-// FIX BUG-014: Made lat and lng required (not optional) to prevent NaN being
-// passed to the PostGIS RPC function.
-router.get(
-  '/',
-  [
-    query('lat').notEmpty().withMessage('lat is required').isFloat({ min: -90, max: 90 }).withMessage('Invalid latitude'),
-    query('lng').notEmpty().withMessage('lng is required').isFloat({ min: -180, max: 180 }).withMessage('Invalid longitude'),
-    query('category').optional().isString(),
-  ],
-  validate,
-  getNearbyProviders
+// Owner decision: no wallet, so no withdrawals. Payouts are settled outside the app for now.
+router.post('/withdraw', (_req, res) =>
+  res.status(410).json({ success: false, code: 'GONE', message: 'In-app withdrawals are not offered.' }),
 );
+// Audit BE-X14: partner lists and profiles need a signed-in user (no anonymous scraping).
+router.use(authenticate);
 
-// ─── Protected static sub-routes (MUST be defined before /:id) ───────────────
-// FIX BUG-013: Moved all static sub-routes ABOVE the /:id param route.
-// Express matches routes in order — /:id would have shadowed /earnings, /profile, etc.
+const boolish = z
+  .enum(['true', 'false', '1', '0'])
+  .transform((v) => v === 'true' || v === '1')
+  .default('false');
 
-// PATCH /api/v1/providers/profile
-router.patch('/profile', authenticate, providerOnly, updateProviderProfile);
+const nearbyQuery = pagination.extend({
+  lat,
+  lng,
+  radiusKm: z.coerce.number().min(0.5).max(25).optional(),
+  category: slug.optional(),
+  serviceId: uuid.optional(),
+  sort: z.enum(['distance', 'rating', 'price']).default('distance'),
+  onlineOnly: boolish,
+});
 
-// POST /api/v1/providers/skills
-router.post('/skills', authenticate, providerOnly, setProviderSkills);
+const idParam = z.object({ id: firebaseUid });
 
-// POST /api/v1/providers/kyc
-router.post('/kyc', authenticate, providerOnly, uploadKyc);
+const profileShape = {
+  title: z.string().trim().min(3).max(60).optional(),
+  bio: z.string().trim().max(600).optional(),
+  years: z.number().int().min(0).max(60).optional(),
+  languages: z.array(z.string().trim().min(2).max(30)).max(8).optional(),
+  pricePerHour: z.number().int().min(50).max(10000).optional(),
+  areas: z.array(z.string().trim().min(2).max(60)).max(20).optional(),
+};
+const categorySlugs = z
+  .array(slug)
+  .min(1)
+  .max(5)
+  .transform((a) => [...new Set(a)]);
 
-// GET /api/v1/providers/earnings
-router.get('/earnings', authenticate, providerOnly, getEarnings);
+const registerBody = z
+  .object({
+    name: personName,
+    email: z.string().trim().toLowerCase().email().max(254).optional(),
+    city: z.string().trim().min(2).max(60).optional(),
+    categorySlugs,
+    ...profileShape,
+  })
+  .strict();
 
-// POST /api/v1/providers/withdraw
-router.post(
-  '/withdraw',
-  authenticate,
-  providerOnly,
-  [body('amount').isFloat({ min: 1 }).withMessage('amount must be a positive number')],
-  validate,
-  requestWithdrawal
-);
+const updateBody = z.object({ ...profileShape, categorySlugs: categorySlugs.optional() }).strict();
 
-// ─── Dynamic :id route (MUST be last) ─────────────────────────────────────────
-// Public: GET /api/v1/providers/:id
-router.get('/:id', [uuidParamValidation('id')], validate, getProviderById);
+// Partner self-service. Registered before /:id so "me" is never a partner id.
+router.post('/register', writeLimiter, validate({ body: registerBody }), asyncHandler(c.register));
+router.get('/me', requirePartner, asyncHandler(c.getMe));
+router.patch('/me', requirePartner, writeLimiter, validate({ body: updateBody }), asyncHandler(c.updateMe));
+router.patch('/profile', requirePartner, writeLimiter, validate({ body: updateBody }), asyncHandler(c.updateMe)); // v1 alias
+router.post('/skills', requirePartner, writeLimiter, validate({ body: updateBody }), asyncHandler(c.updateMe)); // v1 alias
+
+// KYC upload, dashboard and earnings ship in Backend Phase 6.
+const later = (feature) => (_req, _res, next) => next(notImplemented(feature, 6));
+router.post('/kyc', requirePartner, later('KYC upload'));
+router.get('/earnings', requirePartner, later('Partner earnings'));
+router.get('/me/dashboard', requirePartner, later('Partner dashboard'));
+
+router.get('/', validate({ query: nearbyQuery }), asyncHandler(c.listNearby));
+router.get('/:id', validate({ params: idParam }), asyncHandler(c.getProvider));
+router.get('/:id/reviews', validate({ params: idParam, query: pagination }), asyncHandler(c.listProviderReviews));
 
 export default router;

@@ -1,45 +1,57 @@
 import { Router } from 'express';
-import { authenticate, seekerOnly } from '../middleware/auth.js';
-import { validate } from '../middleware/validate.js';
-import { nameValidation, uuidParamValidation } from '../utils/validators.js';
-import { body } from 'express-validator';
-import {
-  getMe,
-  updateProfile,
-  getAddresses,
-  addAddress,
-  deleteAddress,
-} from '../controllers/users.controller.js';
+import { z } from 'zod';
+import * as c from '../controllers/users.controller.js';
+import { authenticate } from '../middleware/auth.js';
+import { writeLimiter } from '../middleware/rateLimiter.js';
+import { lat, lng, personName, pincode, uuid, validate } from '../utils/validators.js';
+import { asyncHandler } from '../utils/response.js';
 
 const router = Router();
-
-// All user routes require authentication
 router.use(authenticate);
 
-// GET /api/v1/users/me
-router.get('/me', getMe);
+const profileBody = z
+  .object({
+    name: personName.optional(),
+    email: z.string().trim().toLowerCase().email().max(254).optional(),
+    city: z.string().trim().min(2).max(60).optional(),
+    photoUrl: z.string().url().startsWith('https://').max(500).nullable().optional(),
+  })
+  .strict();
 
-// PATCH /api/v1/users/profile
-router.patch('/profile', [nameValidation], validate, updateProfile);
+const label = z.enum(['home', 'work', 'other', 'Home', 'Work', 'Other']).transform((v) => v.toLowerCase());
 
-// GET /api/v1/users/addresses
-router.get('/addresses', seekerOnly, getAddresses);
+const addressBody = z
+  .object({
+    label: label.default('home'),
+    line1: z.string().trim().min(3).max(200),
+    line2: z.string().trim().max(200).optional(),
+    city: z.string().trim().min(2).max(60),
+    pincode,
+    lat,
+    lng,
+    isDefault: z.boolean().optional(),
+  })
+  .strict();
 
-// POST /api/v1/users/addresses
-router.post(
-  '/addresses',
-  seekerOnly,
-  [
-    body('label').trim().notEmpty().withMessage('Label is required'),
-    body('lat').isFloat({ min: -90, max: 90 }).withMessage('Invalid latitude'),
-    body('lng').isFloat({ min: -180, max: 180 }).withMessage('Invalid longitude'),
-    body('fullAddress').trim().notEmpty().withMessage('Full address is required'),
-  ],
-  validate,
-  addAddress
+const addressPatch = addressBody
+  .partial()
+  .refine((v) => (v.lat === undefined) === (v.lng === undefined), { message: 'Send lat and lng together' });
+
+const idParam = z.object({ id: uuid });
+
+router.get('/me', asyncHandler(c.getMe));
+router.patch('/me', writeLimiter, validate({ body: profileBody }), asyncHandler(c.updateMe));
+router.patch('/profile', writeLimiter, validate({ body: profileBody }), asyncHandler(c.updateMe)); // v1 alias
+router.delete('/me', writeLimiter, asyncHandler(c.deleteMe));
+
+router.get('/addresses', asyncHandler(c.listAddresses));
+router.post('/addresses', writeLimiter, validate({ body: addressBody }), asyncHandler(c.createAddress));
+router.patch(
+  '/addresses/:id',
+  writeLimiter,
+  validate({ params: idParam, body: addressPatch }),
+  asyncHandler(c.updateAddress),
 );
-
-// DELETE /api/v1/users/addresses/:id
-router.delete('/addresses/:id', seekerOnly, [uuidParamValidation('id')], validate, deleteAddress);
+router.delete('/addresses/:id', writeLimiter, validate({ params: idParam }), asyncHandler(c.deleteAddress));
 
 export default router;

@@ -1,108 +1,45 @@
-import { supabaseAdmin } from '../config/supabase.js';
-import { SOCKET_EVENTS, BOOKING_STATUS, JOB_ACCEPT_TIMEOUT_SECONDS } from '../config/constants.js';
-import { logger } from '../utils/logger.js';
-
 /**
- * Register all booking-related Socket.IO events.
- * @param {import('socket.io').Server} io
- * @param {import('socket.io').Socket} socket
+ * Booking rooms. State changes go through the REST API only (Backend Phase 3);
+ * sockets just deliver updates. A user may watch a booking only if they are its
+ * customer or its assigned partner.
+ *   booking:watch   { bookingId } -> joins room booking:<id>
+ *   booking:unwatch { bookingId }
  */
-export const registerBookingEvents = (io, socket) => {
+import { z } from 'zod';
+import { SOCKET_EVENTS } from '../config/constants.js';
+import { db } from '../config/supabase.js';
+import { notFound, unwrap } from '../utils/errors.js';
+import { safeOn } from './safeOn.js';
 
-  // ─── Provider marks arrival ───────────────────────────────────────────────
-  socket.on(SOCKET_EVENTS.PROVIDER_ARRIVED, async ({ bookingId }) => {
-    try {
-      const { data: booking, error } = await supabaseAdmin
-        .from('bookings')
-        .update({ status: BOOKING_STATUS.IN_PROGRESS, provider_arrived_at: new Date().toISOString() })
-        .eq('id', bookingId)
-        .eq('provider_id', socket.userId)
-        .select('seeker_id')
-        .single();
+const payload = z.object({ bookingId: z.string().uuid() });
 
-      if (error) throw error;
+export const canWatchBooking = async (uid, bookingId) => {
+  const row = unwrap(
+    await db().from('bookings').select('id, customer_id, provider_id').eq('id', bookingId).maybeSingle(),
+  );
+  return !!row && (row.customer_id === uid || row.provider_id === uid);
+};
 
-      // Notify seeker that provider has arrived
-      io.to(`user:${booking.seeker_id}`).emit(SOCKET_EVENTS.BOOKING_STATUS_UPDATE, {
-        bookingId,
-        status: BOOKING_STATUS.IN_PROGRESS,
-        event: 'provider_arrived',
-      });
+export const registerBookingEvents = (_io, socket) => {
+  safeOn(
+    socket,
+    SOCKET_EVENTS.BOOKING_WATCH,
+    payload,
+    async ({ bookingId }) => {
+      if (!(await canWatchBooking(socket.data.uid, bookingId))) throw notFound('Booking');
+      socket.join(`booking:${bookingId}`);
+      return { watching: bookingId };
+    },
+    { perMinute: 30 },
+  );
 
-      logger.info(`Provider ${socket.userId} arrived for booking ${bookingId}`);
-    } catch (err) {
-      logger.error(`provider_arrived error: ${err.message}`);
-      socket.emit('error', { message: 'Failed to update arrival status' });
-    }
-  });
-
-  // ─── Provider starts service ──────────────────────────────────────────────
-  socket.on(SOCKET_EVENTS.JOB_STARTED, async ({ bookingId }) => {
-    try {
-      const { data: booking, error } = await supabaseAdmin
-        .from('bookings')
-        .update({ start_time: new Date().toISOString() })
-        .eq('id', bookingId)
-        .eq('provider_id', socket.userId)
-        .select('seeker_id')
-        .single();
-
-      if (error) throw error;
-
-      io.to(`user:${booking.seeker_id}`).emit(SOCKET_EVENTS.BOOKING_STATUS_UPDATE, {
-        bookingId,
-        status: 'in_progress',
-        event: 'job_started',
-      });
-    } catch (err) {
-      logger.error(`job_started error: ${err.message}`);
-    }
-  });
-
-  // ─── Provider marks job complete (OTP generation happens via REST API) ────
-  socket.on(SOCKET_EVENTS.JOB_COMPLETED, async ({ bookingId }) => {
-    try {
-      const { data: booking, error } = await supabaseAdmin
-        .from('bookings')
-        .select('seeker_id')
-        .eq('id', bookingId)
-        .eq('provider_id', socket.userId)
-        .single();
-
-      if (error) throw error;
-
-      io.to(`user:${booking.seeker_id}`).emit(SOCKET_EVENTS.BOOKING_STATUS_UPDATE, {
-        bookingId,
-        event: 'job_completed_pending_otp',
-      });
-    } catch (err) {
-      logger.error(`job_completed socket error: ${err.message}`);
-    }
+  safeOn(socket, SOCKET_EVENTS.BOOKING_UNWATCH, payload, ({ bookingId }) => {
+    socket.leave(`booking:${bookingId}`);
+    return { watching: null };
   });
 };
 
-/**
- * Broadcast a new job to nearby providers.
- * Called from the bookings REST controller after creating a booking.
- * @param {import('socket.io').Server} io
- * @param {string[]} providerIds - UUIDs of providers to notify
- * @param {object} jobPayload - Job details to send
- */
-export const broadcastJobToProviders = (io, providerIds, jobPayload) => {
-  const acceptTimer = setTimeout(() => {
-    // Auto-expire: emit cancellation if no one accepted
-    for (const providerId of providerIds) {
-      io.to(`user:${providerId}`).emit('job_expired', { bookingId: jobPayload.bookingId });
-    }
-    logger.info(`Job ${jobPayload.bookingId} expired after ${JOB_ACCEPT_TIMEOUT_SECONDS}s`);
-  }, JOB_ACCEPT_TIMEOUT_SECONDS * 1000);
-
-  for (const providerId of providerIds) {
-    io.to(`user:${providerId}`).emit(SOCKET_EVENTS.NEW_JOB, jobPayload);
-  }
-
-  logger.info(`Job ${jobPayload.bookingId} broadcast to ${providerIds.length} providers`);
-
-  // Return the timer so it can be cleared on acceptance
-  return acceptTimer;
+/** Server-side helpers for controllers (Phase 3). */
+export const emitBookingUpdate = (io, booking) => {
+  io.to(`booking:${booking.id}`).emit(SOCKET_EVENTS.BOOKING_UPDATED, booking);
 };

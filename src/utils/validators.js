@@ -1,57 +1,59 @@
-import { validationResult, body, param, query } from 'express-validator';
-import { error } from './response.js';
-
 /**
- * Run validation result check — call after express-validator chain.
- * Returns 422 with detailed errors if validation fails.
+ * zod schemas and the request validation middleware.
+ * validate({ body, query, params }) replaces req.body/query/params with the
+ * parsed values, so handlers only ever see clean, typed input.
  */
-export const validate = (req, res, next) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return error(res, 'Validation failed', 422, errors.array());
-  }
-  next();
-};
+import { z } from 'zod';
+import { validationFailed } from './errors.js';
+import { PAGE } from '../config/constants.js';
 
-// ─── Reusable Validation Chains ──────────────────────────────────────────────
+export const firebaseUid = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Za-z0-9_-]+$/, 'Invalid id');
+export const uuid = z.string().uuid('Invalid id');
+export const slug = z
+  .string()
+  .min(1)
+  .max(60)
+  .regex(/^[a-z0-9-]+$/, 'Invalid slug');
+export const idOrSlug = z.union([uuid, slug]);
+export const lat = z.coerce.number().min(-90).max(90);
+export const lng = z.coerce.number().min(-180).max(180);
+export const indianPhone = z
+  .string()
+  .transform((v) => v.replace(/[\s-]/g, '').replace(/^(\+91|91|0)(?=[6-9]\d{9}$)/, ''))
+  .pipe(z.string().regex(/^[6-9]\d{9}$/, 'Enter a valid 10-digit mobile number'));
+export const pincode = z.string().regex(/^[1-9][0-9]{5}$/, 'Enter a valid 6-digit PIN code');
+export const personName = z.string().trim().min(2, 'Name is too short').max(80);
 
-export const phoneValidation = body('phone')
-  .trim()
-  .matches(/^[6-9]\d{9}$/)
-  .withMessage('Enter a valid 10-digit Indian mobile number');
+export const pagination = z.object({
+  limit: z.coerce.number().int().min(1).max(PAGE.maxSize).default(PAGE.defaultSize),
+  offset: z.coerce.number().int().min(0).max(10000).default(0),
+});
 
-export const otpValidation = body('otp')
-  .trim()
-  .isLength({ min: 6, max: 6 })
-  .isNumeric()
-  .withMessage('OTP must be 6 digits');
+const toIssues = (error, where) =>
+  error.issues.map((i) => ({ field: [where, ...i.path].join('.'), message: i.message }));
 
-export const nameValidation = body('name')
-  .optional()
-  .trim()
-  .isLength({ min: 2, max: 60 })
-  .withMessage('Name must be 2–60 characters');
-
-export const emailValidation = body('email')
-  .optional()
-  .trim()
-  .isEmail()
-  .normalizeEmail()
-  .withMessage('Enter a valid email address');
-
-export const latLngValidation = [
-  query('lat').optional().isFloat({ min: -90, max: 90 }).withMessage('Invalid latitude'),
-  query('lng').optional().isFloat({ min: -180, max: 180 }).withMessage('Invalid longitude'),
-];
-
-export const uuidParamValidation = (paramName = 'id') =>
-  param(paramName).isUUID().withMessage(`${paramName} must be a valid UUID`);
-
-export const paginationValidation = [
-  query('page').optional().isInt({ min: 1 }).withMessage('page must be ≥ 1'),
-  query('limit').optional().isInt({ min: 1, max: 100 }).withMessage('limit must be 1–100'),
-];
-
-export const ratingValidation = body('rating')
-  .isFloat({ min: 1, max: 5 })
-  .withMessage('Rating must be between 1 and 5');
+export const validate =
+  ({ body, query, params } = {}) =>
+  (req, _res, next) => {
+    const issues = [];
+    for (const [where, schema] of [
+      ['params', params],
+      ['query', query],
+      ['body', body],
+    ]) {
+      if (!schema) continue;
+      const result = schema.safeParse(req[where] ?? {});
+      if (result.success) {
+        // req.query is a getter in Express 5; assign via defineProperty to be safe.
+        Object.defineProperty(req, where, { value: result.data, writable: true, configurable: true, enumerable: true });
+      } else {
+        issues.push(...toIssues(result.error, where));
+      }
+    }
+    if (issues.length) return next(validationFailed(issues));
+    return next();
+  };

@@ -1,80 +1,61 @@
-// ─── Platform Business Rules ──────────────────────────────────────────────────
-export const PLATFORM_FEE_PERCENT = 15; // 15% commission taken from each booking
+/**
+ * Marketplace rules and shared enums. Numbers that the owner may change are
+ * read from the environment (see env.js) so no redeploy of code is needed.
+ */
+import { env } from './env.js';
 
-// ─── Booking Lifecycle Timeouts ───────────────────────────────────────────────
-export const MATCHING_TIMEOUT_SECONDS = 90;       // How long to search for a provider
-export const JOB_ACCEPT_TIMEOUT_SECONDS = 30;     // How long a provider has to accept
-export const FREE_CANCEL_WINDOW_SECONDS = 120;    // 2 minutes free cancellation
-export const CANCEL_FEE_INR = 50;                 // Rs. 50 fee after free window
+export const RULES = Object.freeze({
+  matchRadiusKm: env.MATCH_RADIUS_KM, // owner decision: 5 km
+  jobOfferSeconds: env.JOB_OFFER_SECONDS, // owner decision: 45 s
+  matchingTimeoutSeconds: env.MATCHING_TIMEOUT_SECONDS,
+  platformFeeInr: env.PLATFORM_FEE_INR, // owner decision: no fee for now
+  cancellationFeeInr: env.CANCELLATION_FEE_INR, // owner decision: no fee for now
+  walletEnabled: false, // owner decision: no wallet for now
+  locationMinIntervalMs: env.LOCATION_MIN_INTERVAL_MS,
+  dispatchIntervalMs: env.DISPATCH_INTERVAL_MS,
+  dispatchLeadMinutes: env.DISPATCH_LEAD_MINUTES,
+  maxActiveBookings: env.MAX_ACTIVE_BOOKINGS,
+  maxScheduleDays: env.MAX_SCHEDULE_DAYS,
+  minScheduleLeadMinutes: 30, // a "later" slot must be at least 30 minutes away
+});
 
-// ─── Location Tracking ────────────────────────────────────────────────────────
-export const LOCATION_UPDATE_INTERVAL_MS = 5000;  // Provider GPS update frequency
-export const PROVIDER_SEARCH_RADIUS_KM = 3;        // Default provider search radius
+export const PAGE = Object.freeze({ defaultSize: 20, maxSize: 50 });
 
-// ─── OTP Configuration ───────────────────────────────────────────────────────
-export const OTP_EXPIRY_MINUTES = 10;              // OTP valid for 10 minutes
-export const OTP_MAX_ATTEMPTS = 3;                 // Wrong OTP attempts before lock
-export const OTP_LOCK_MINUTES = 15;                // Lock duration after max attempts
-export const OTP_RESEND_COOLDOWN_SECONDS = 30;     // Resend OTP cooldown
-
-// ─── Wallet ───────────────────────────────────────────────────────────────────
-export const MIN_WITHDRAWAL_INR = 100;             // Minimum payout amount
-
-// ─── Pagination ───────────────────────────────────────────────────────────────
-export const DEFAULT_PAGE_SIZE = 20;
-export const MAX_PAGE_SIZE = 100;
-
-// ─── Booking Status Enum ─────────────────────────────────────────────────────
-export const BOOKING_STATUS = {
+/** Booking lifecycle (mirrors the booking_status enum in the database). */
+export const BOOKING_STATUS = Object.freeze({
   SEARCHING: 'searching',
-  MATCHED: 'matched',
+  ASSIGNED: 'assigned',
   EN_ROUTE: 'en_route',
+  ARRIVED: 'arrived',
   IN_PROGRESS: 'in_progress',
   COMPLETED: 'completed',
   CANCELLED: 'cancelled',
-};
+  NO_PROVIDERS: 'no_providers',
+});
 
-// ─── Payment Status Enum ─────────────────────────────────────────────────────
-export const PAYMENT_STATUS = {
-  PENDING: 'pending',
-  CAPTURED: 'captured',
-  REFUNDED: 'refunded',
-};
+export const ACTIVE_BOOKING_STATUSES = Object.freeze(['assigned', 'en_route', 'arrived', 'in_progress']);
 
-// ─── KYC Status Enum ─────────────────────────────────────────────────────────
-export const KYC_STATUS = {
+export const KYC_STATUS = Object.freeze({
+  NOT_STARTED: 'not_started',
   PENDING: 'pending',
-  VERIFIED: 'verified',
+  APPROVED: 'approved',
   REJECTED: 'rejected',
-};
+});
 
-// ─── User Roles ───────────────────────────────────────────────────────────────
-export const USER_ROLE = {
-  SEEKER: 'seeker',
-  PROVIDER: 'provider',
-};
-
-// ─── Socket Events ───────────────────────────────────────────────────────────
-export const SOCKET_EVENTS = {
-  // Provider → Server
-  GO_ONLINE: 'go_online',
-  GO_OFFLINE: 'go_offline',
-  LOCATION_UPDATE: 'location_update',
-  PROVIDER_ARRIVED: 'provider_arrived',
-  JOB_STARTED: 'job_started',
-  JOB_COMPLETED: 'job_completed',
-
-  // Server → Provider
-  NEW_JOB: 'new_job',
-
-  // Server → Seeker
-  JOB_ACCEPTED: 'job_accepted',
-  JOB_CANCELLED_PROVIDER: 'job_cancelled_provider',
-  PROVIDER_LOCATION: 'provider_location',
-  BOOKING_STATUS_UPDATE: 'booking_status_update',
-
-  // Bidirectional
-  CHAT_MESSAGE: 'chat_message',
-  TYPING_START: 'typing_start',
-  TYPING_STOP: 'typing_stop',
-};
+/** Socket.IO event names. See docs/realtime.md. */
+export const SOCKET_EVENTS = Object.freeze({
+  // client -> server
+  PARTNER_ONLINE: 'partner:online',
+  PARTNER_OFFLINE: 'partner:offline',
+  PARTNER_LOCATION: 'partner:location',
+  BOOKING_WATCH: 'booking:watch',
+  BOOKING_UNWATCH: 'booking:unwatch',
+  // server -> client
+  PARTNER_STATE: 'partner:state',
+  BOOKING_LOCATION: 'booking:location',
+  BOOKING_UPDATED: 'booking:updated',
+  JOB_OFFER: 'job:offer',
+  JOB_OFFER_CLOSED: 'job:offer_closed',
+  NOTIFICATION_NEW: 'notification:new',
+  ERROR: 'error:event',
+});
