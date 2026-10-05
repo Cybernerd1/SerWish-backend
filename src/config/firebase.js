@@ -15,15 +15,50 @@ import { logger } from '../utils/logger.js';
 
 const normaliseKey = (key) => {
   let k = String(key).trim();
-  if ((k.startsWith('"') && k.endsWith('"')) || (k.startsWith("'") && k.endsWith("'"))) k = k.slice(1, -1);
-  return k.replace(/\\n/g, '\n');
+  // Copied out of the service-account JSON along with its closing quote and the
+  // trailing comma, so the quotes can be unbalanced. A PEM contains neither
+  // character, which makes stripping them unconditionally safe.
+  k = k.replace(/[,;]+$/, '').trim();
+  k = k.replace(/^["']+/, '').replace(/["']+$/, '').trim();
+  // Literal "\n"/"\r\n" escapes (single-line env fields) and CRLF from dashboard editors.
+  return k.replace(/\\r/g, '').replace(/\\n/g, '\n').replace(/\r/g, '').trim();
 };
+
+const canParse = (pem) => {
+  try {
+    crypto.createPrivateKey(pem);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Rebuild a PEM whose line breaks were lost on the way into the environment:
+ * newlines turned into spaces, or stripped altogether. The base64 body is
+ * intact in both cases, so re-wrapping it at 64 columns restores a valid key.
+ */
+const repairPem = (k) => {
+  const flat = k.replace(/\s+/g, '');
+  const m = /^-+BEGIN([A-Z]*PRIVATEKEY)-+([A-Za-z0-9+/=]+)-+END\1-+$/.exec(flat);
+  if (!m) return null;
+  const label = m[1] === 'PRIVATEKEY' ? 'PRIVATE KEY' : m[1].replace('PRIVATEKEY', ' PRIVATE KEY');
+  return `-----BEGIN ${label}-----\n${m[2].match(/.{1,64}/g).join('\n')}\n-----END ${label}-----\n`;
+};
+
+/** Shape of the key we were handed, for the error message. Never logs the key itself. */
+const describeKey = (k) =>
+  `length=${k.length}, lines=${k.split('\n').length}, ` +
+  `beginMarker=${/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(k)}, ` +
+  `endMarker=${/-----END [A-Z ]*PRIVATE KEY-----/.test(k)}`;
 
 /** Resolve service-account credentials from env. Exported for tests. */
 export const resolveServiceAccount = (e = env) => {
   let account;
+  let source;
   if (e.FIREBASE_SERVICE_ACCOUNT_JSON) {
-    const raw = e.FIREBASE_SERVICE_ACCOUNT_JSON.trim();
+    source = 'FIREBASE_SERVICE_ACCOUNT_JSON';
+    const raw = e.FIREBASE_SERVICE_ACCOUNT_JSON.replace(/^[\s\uFEFF]+|[\s\uFEFF]+$/g, '');
     const text = raw.startsWith('{') ? raw : Buffer.from(raw, 'base64').toString('utf8');
     try {
       account = JSON.parse(text);
@@ -31,12 +66,14 @@ export const resolveServiceAccount = (e = env) => {
       throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON (or base64-encoded JSON).');
     }
   } else if (e.GOOGLE_APPLICATION_CREDENTIALS) {
+    source = 'GOOGLE_APPLICATION_CREDENTIALS';
     try {
       account = JSON.parse(fs.readFileSync(e.GOOGLE_APPLICATION_CREDENTIALS, 'utf8'));
     } catch (err) {
       throw new Error(`Could not read GOOGLE_APPLICATION_CREDENTIALS: ${err.message}`);
     }
   } else if (e.FIREBASE_PROJECT_ID && e.FIREBASE_CLIENT_EMAIL && e.FIREBASE_PRIVATE_KEY) {
+    source = 'FIREBASE_PRIVATE_KEY';
     account = {
       project_id: e.FIREBASE_PROJECT_ID,
       client_email: e.FIREBASE_CLIENT_EMAIL,
@@ -48,16 +85,20 @@ export const resolveServiceAccount = (e = env) => {
 
   const projectId = account.project_id ?? account.projectId;
   const clientEmail = account.client_email ?? account.clientEmail;
-  const privateKey = normaliseKey(account.private_key ?? account.privateKey ?? '');
+  let privateKey = normaliseKey(account.private_key ?? account.privateKey ?? '');
   if (!projectId || !clientEmail || !privateKey) {
     throw new Error('Firebase service account must include project_id, client_email and private_key.');
   }
-  try {
-    crypto.createPrivateKey(privateKey);
-  } catch {
-    throw new Error(
-      'Firebase private key could not be parsed. Paste the whole service-account JSON into FIREBASE_SERVICE_ACCOUNT_JSON (base64 is fine) instead of the key alone.',
-    );
+  if (!canParse(privateKey)) {
+    const repaired = repairPem(privateKey);
+    if (!repaired || !canParse(repaired)) {
+      throw new Error(
+        `Firebase private key from ${source} could not be parsed (${describeKey(privateKey)}). ` +
+          'Paste the whole service-account JSON into FIREBASE_SERVICE_ACCOUNT_JSON (base64 is fine) instead of the key alone.',
+      );
+    }
+    privateKey = repaired;
+    logger.warn(`Firebase private key from ${source} had no line breaks; rebuilt the PEM.`);
   }
   return { projectId, clientEmail, privateKey };
 };
