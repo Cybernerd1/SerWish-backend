@@ -9,13 +9,17 @@ import { createServer } from 'node:http';
 
 process.env.NODE_ENV = 'test';
 process.env.DISPATCH_INTERVAL_MS ??= '700';
+process.env.KYC_PROVIDER ??= 'fake';
 
-const [{ createApp }, firebase, { initSocket }, dispatcher] = await Promise.all([
+const [{ createApp }, firebase, { initSocket }, dispatcher, kycStore] = await Promise.all([
   import('../src/app.js'),
   import('../src/config/firebase.js'),
   import('../src/socket/index.js'),
   import('../src/services/dispatcher.js'),
+  import('../src/services/kyc/storage.js'),
 ]);
+// Verification photos stay in memory (a bare PostgREST has no Storage API).
+kycStore.__setKycStorageForTests(kycStore.memoryStore());
 
 const revoked = new Set();
 firebase.__setFirebaseAuthForTests({

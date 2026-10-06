@@ -32,6 +32,8 @@ tags:
   - name: Bookings
   - name: Payments
   - name: Partner tools
+  - name: Partner KYC
+  - name: Admin
 
 paths:
   /auth/session:
@@ -431,12 +433,181 @@ paths:
       responses:
         '200': { description: Updated }
         '422': { $ref: '#/components/responses/Invalid' }
+  /providers/me/kyc:
+    get:
+      tags: [Partner KYC]
+      x-status: live
+      summary: The partner's verification state (steps, what is missing, can submit)
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/KycEnvelope' } } } }
+        '403': { description: '`PARTNER_ONLY`' }
   /providers/kyc:
     post:
-      tags: [Partner tools]
-      x-status: phase-6
-      summary: Submit ID and certificate (signed upload URLs to the private kyc bucket)
-      responses: { '501': { $ref: '#/components/responses/NotYet' } }
+      tags: [Partner KYC]
+      x-status: gone
+      summary: v1 one-shot document upload, replaced by the step endpoints below
+      responses: { '410': { description: '`GONE`' } }
+  /providers/kyc/consent:
+    post:
+      tags: [Partner KYC]
+      x-status: live
+      summary: Accept the verification terms (moves not_started -> in_progress)
+      requestBody:
+        content: { application/json: { schema: { type: object, required: [version], properties: { version: { type: string, example: partner-kyc-v1 } } } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/KycEnvelope' } } } }
+        '409': { description: '`CONSENT_OUTDATED` (send the version from GET /providers/me/kyc), `KYC_IN_REVIEW`, `KYC_APPROVED`' }
+  /providers/kyc/digilocker/start:
+    post:
+      tags: [Partner KYC]
+      x-status: live
+      summary: Open a DigiLocker request; the app sends the partner to consentUrl (valid 10 minutes)
+      description: |
+        After consent on DigiLocker the partner lands on `/providers/kyc/digilocker/return`, which
+        opens `serwish://kyc/digilocker?ref=...` in the app. Then call `/digilocker/complete`.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      verificationId: { type: string, example: swdl_3f9a0c1d2e4b5a6978c0d1e2 }
+                      consentUrl: { type: string, format: uri }
+                      expiresAt: { type: string, format: date-time }
+        '409': { description: '`CONSENT_REQUIRED`, `KYC_IN_REVIEW`' }
+        '429': { description: '`TOO_MANY_ATTEMPTS` (8 a day)' }
+        '503': { description: '`DIGILOCKER_UNAVAILABLE` (KYC_PROVIDER=manual) or the provider is down' }
+  /providers/kyc/digilocker/complete:
+    post:
+      tags: [Partner KYC]
+      x-status: live
+      summary: Read the shared Aadhaar (last 4 digits, name, date of birth, photo for face match)
+      requestBody:
+        content: { application/json: { schema: { type: object, required: [verificationId], properties: { verificationId: { type: string } } } } }
+      responses:
+        '200': { description: Identity verified, content: { application/json: { schema: { $ref: '#/components/schemas/KycEnvelope' } } } }
+        '404': { description: Not this partner's request }
+        '409': { description: '`DIGILOCKER_PENDING` - the partner has not allowed access yet; call again' }
+        '422': { description: '`DIGILOCKER_DENIED`, `DIGILOCKER_EXPIRED`, `UNDERAGE`, `DUPLICATE_IDENTITY` (data.kyc has the step state)' }
+  /providers/kyc/digilocker/return:
+    get:
+      tags: [Partner KYC]
+      x-status: live
+      security: []
+      summary: Public page DigiLocker redirects to; hands the partner back to the app
+      parameters: [{ name: ref, in: query, schema: { type: string } }]
+      responses: { '200': { description: HTML } }
+  /providers/kyc/identity:
+    post:
+      tags: [Partner KYC]
+      x-status: live
+      summary: Another government ID (no DigiLocker) - goes to admin review
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [docType, front]
+              properties:
+                docType: { type: string, enum: [pan, driving_licence, voter_id, passport] }
+                front: { type: string, format: binary, description: 'JPG/PNG/WebP/HEIC, max 6 MB' }
+                back: { type: string, format: binary, description: Required except for PAN }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/KycEnvelope' } } } }
+        '413': { description: '`FILE_TOO_LARGE`' }
+        '415': { description: '`MULTIPART_REQUIRED`' }
+        '422': { $ref: '#/components/responses/Invalid' }
+  /providers/kyc/selfie:
+    post:
+      tags: [Partner KYC]
+      x-status: live
+      summary: Selfie - liveness and face match against the ID photo (3 tries, then admin review)
+      requestBody:
+        content: { multipart/form-data: { schema: { type: object, required: [photo], properties: { photo: { type: string, format: binary } } } } }
+      responses:
+        '200': { description: done or review, content: { application/json: { schema: { $ref: '#/components/schemas/KycEnvelope' } } } }
+        '409': { description: '`IDENTITY_FIRST`, `SELFIE_IN_REVIEW`' }
+        '422': { description: '`FACE_MISMATCH`, `LIVENESS_FAILED` (data.kyc.steps.selfie.attemptsLeft)' }
+  /providers/kyc/bank:
+    post:
+      tags: [Partner KYC]
+      x-status: live
+      summary: Payout account - penny drop and name match. Allowed after approval too (account change).
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [accountNumber, ifsc, holderName]
+              properties:
+                accountNumber: { type: string, pattern: '^[0-9]{9,18}$', description: Never stored; last 4 digits and a salted hash only }
+                ifsc: { type: string, example: SBIN0001234 }
+                holderName: { type: string }
+      responses:
+        '200': { description: done (name matches the ID) or review, content: { application/json: { schema: { $ref: '#/components/schemas/KycEnvelope' } } } }
+        '422': { description: '`BANK_INVALID` or `VALIDATION_FAILED`' }
+        '429': { description: '`TOO_MANY_ATTEMPTS` (10 in total)' }
+  /providers/kyc/certificate:
+    post:
+      tags: [Partner KYC]
+      x-status: live
+      summary: Skill certificate (image or PDF); required only for KYC_CERT_REQUIRED_CATEGORIES
+      requestBody:
+        content: { multipart/form-data: { schema: { type: object, required: [file], properties: { file: { type: string, format: binary } } } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/KycEnvelope' } } } }
+  /providers/kyc/submit:
+    post:
+      tags: [Partner KYC]
+      x-status: live
+      summary: Send for admin review (kyc_status -> pending)
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/KycEnvelope' } } } }
+        '409': { description: '`KYC_INCOMPLETE` (data.missing), `KYC_IN_REVIEW`, `KYC_APPROVED`' }
+  /admin/kyc/queue:
+    get:
+      tags: [Admin]
+      x-status: live
+      summary: Verification cases, oldest submission first (admins only)
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [pending, in_progress, rejected, approved, not_started], default: pending } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+      responses:
+        '200': { description: 'Case summaries: name, masked phone, city, categories, flags, step states' }
+        '403': { description: '`FORBIDDEN` (not an admin)' }
+  /admin/kyc/{partnerId}:
+    get:
+      tags: [Admin]
+      x-status: live
+      summary: Full case - verified fields, 5-minute document links, history (the view is logged)
+      parameters: [{ name: partnerId, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK }, '404': { $ref: '#/components/responses/NotFound' } }
+  /admin/kyc/{partnerId}/decision:
+    post:
+      tags: [Admin]
+      x-status: live
+      summary: Approve, or reject with reasons and the steps to redo. Notifies the partner (push + socket partner:kyc).
+      parameters: [{ name: partnerId, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: { type: string, enum: [approve, reject] }
+                reasons: { type: array, items: { type: string }, description: Required to reject }
+                note: { type: string }
+                failedSteps: { type: array, items: { type: string, enum: [identity, selfie, bank, certificate] }, description: Required to reject }
+      responses:
+        '200': { description: The partner's new state, content: { application/json: { schema: { $ref: '#/components/schemas/KycEnvelope' } } } }
+        '409': { description: '`RULE_VIOLATION` (not submitted) or `KYC_INCOMPLETE`' }
   /providers/earnings:
     get:
       tags: [Partner tools]
@@ -713,6 +884,35 @@ components:
       description: '`NOT_IMPLEMENTED` until Backend Phase 3'
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
   schemas:
+    KycEnvelope:
+      type: object
+      properties:
+        success: { const: true }
+        message: { type: string }
+        data: { $ref: '#/components/schemas/Kyc' }
+    KycStep:
+      type: string
+      enum: [todo, pending, done, review, failed]
+    Kyc:
+      type: object
+      description: Masked values only (last 4 digits, verified names); never document numbers, paths or hashes.
+      properties:
+        status: { type: string, enum: [not_started, in_progress, pending, approved, rejected] }
+        level: { type: integer, description: '0 none, 1 identity, 2 approved (identity + face + bank)' }
+        consent: { type: object, properties: { accepted: { type: boolean }, acceptedAt: { type: string, nullable: true }, version: { type: string } } }
+        digilocker: { type: object, properties: { available: { type: boolean } } }
+        steps:
+          type: object
+          properties:
+            identity: { type: object, properties: { state: { $ref: '#/components/schemas/KycStep' }, source: { type: string, enum: [digilocker, manual], nullable: true }, docType: { type: string, nullable: true }, name: { type: string, nullable: true }, aadhaarLast4: { type: string, nullable: true }, reason: { type: string, nullable: true } } }
+            selfie: { type: object, properties: { state: { $ref: '#/components/schemas/KycStep' }, attemptsLeft: { type: integer }, reason: { type: string, nullable: true } } }
+            bank: { type: object, properties: { state: { $ref: '#/components/schemas/KycStep' }, holderName: { type: string, nullable: true }, accountLast4: { type: string, nullable: true }, ifsc: { type: string, nullable: true }, reason: { type: string, nullable: true } } }
+            certificate: { type: object, properties: { state: { $ref: '#/components/schemas/KycStep' }, required: { type: boolean }, reason: { type: string, nullable: true } } }
+        canSubmit: { type: boolean }
+        missing: { type: array, items: { type: string, enum: [consent, identity, selfie, bank, certificate] } }
+        submittedAt: { type: string, nullable: true }
+        reviewedAt: { type: string, nullable: true }
+        rejection: { type: object, nullable: true, properties: { reasons: { type: array, items: { type: string } }, note: { type: string, nullable: true } } }
     Ok:
       type: object
       required: [success, message]

@@ -296,11 +296,11 @@ run('API v2 against a real database', () => {
       expect((await get('/api/v1/providers/../../etc')).status).toBe(404);
     });
 
-    it('KYC upload still answers 501 until Phase 6; customers cannot use partner tools', async () => {
+    it('the old one-shot KYC upload is gone; customers cannot use partner tools', async () => {
       const t = fake.issue(uid('partner'));
       const kyc = await request(app).post('/api/v1/providers/kyc').set(auth(t));
-      expect(kyc.status).toBe(501);
-      expect(kyc.body.message).toContain('Phase 6');
+      expect(kyc.status).toBe(410);
+      expect(kyc.body.code).toBe('GONE');
       const cust = fake.issue(uid('me'));
       expect((await request(app).get('/api/v1/providers/me').set(auth(cust))).body.code).toBe('PARTNER_ONLY');
     });

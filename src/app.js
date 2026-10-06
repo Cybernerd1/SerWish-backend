@@ -14,6 +14,8 @@ import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
 import authRoutes from './routes/auth.routes.js';
 import userRoutes from './routes/users.routes.js';
 import providerRoutes from './routes/providers.routes.js';
+import kycRoutes from './routes/kyc.routes.js';
+import adminRoutes from './routes/admin.routes.js';
 import bookingRoutes from './routes/bookings.routes.js';
 import paymentRoutes from './routes/payments.routes.js';
 import reviewRoutes from './routes/reviews.routes.js';
@@ -73,12 +75,14 @@ export const createApp = () => {
   api.use('/offers', offersRouter);
   api.use('/config', configRouter);
   api.use('/search', searchRouter);
+  api.use('/providers/kyc', kycRoutes); // before /providers: has public pages
   api.use('/providers', providerRoutes);
   api.use('/bookings', bookingRoutes);
   api.use('/payments', paymentRoutes);
   api.use('/reviews', reviewRoutes);
   api.use('/job-offers', jobOfferRoutes);
   api.use('/notifications', notificationRoutes);
+  api.use('/admin', adminRoutes);
   app.use('/api/v1', api);
 
   app.use(notFoundHandler);

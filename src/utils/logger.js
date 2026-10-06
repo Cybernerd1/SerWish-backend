@@ -13,7 +13,7 @@ const isTest = process.env.NODE_ENV === 'test';
 const { combine, timestamp, printf, colorize, json, errors } = winston.format;
 
 const SECRET_KEYS =
-  /^(password|token|idtoken|accesstoken|refreshtoken|authorization|otp|otp_hash|secret|signature|razorpay_signature|private_?key|cookie)$/i;
+  /^(password|token|idtoken|accesstoken|refreshtoken|authorization|otp|otp_hash|secret|signature|razorpay_signature|private_?key|cookie|accountnumber|account_number|bank_account|aadhaar|aadhaar_number|pan|ifsc)$/i;
 
 /** Deep-copy an object with secret-looking keys replaced. */
 export const redact = (value, depth = 0) => {

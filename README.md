@@ -26,8 +26,9 @@ Migrations live in `supabase/migrations/` and run in file-name order:
 | `20261001000100_v2_baseline.sql` | The v2 schema, rules, RPCs and lockdown |
 | `20261002000000_v2_bookings.sql` | Dispatcher, partner moves, completion, cancellation, idempotent booking |
 | `20261003000000_v2_reschedule.sql` | Reschedule a booking (releases an assigned partner) |
+| `20261010000000_v2_partner_kyc.sql` | Partner verification: step states, DigiLocker requests, history, `kyc_decide()` |
 
-Apply to Supabase with the CLI (`supabase link` then `supabase db push`), or paste the four v2
+Apply to Supabase with the CLI (`supabase link` then `supabase db push`), or paste the v2
 files into the SQL editor in order. Load demo data with `supabase/seed.sql` (dev/test only: it
 adds 7 fake approved partners around Sector 56, Gurugram).
 
@@ -75,6 +76,25 @@ src/
 supabase/             migrations, seed, SQL rule checks, legacy v1 files
 tests/                vitest unit + integration tests
 ```
+
+## How partner verification works
+
+1. `POST /providers/kyc/consent`, then identity: `digilocker/start` -> partner allows on DigiLocker ->
+   return page opens `serwish://kyc/digilocker` -> `digilocker/complete`. Or `POST /providers/kyc/identity`
+   with photos of PAN, driving licence, voter ID or passport (admin review).
+2. `POST /providers/kyc/selfie` (liveness + face match against the ID photo; after 3 failures a person checks),
+   `POST /providers/kyc/bank` (penny drop + name match), optional `POST /providers/kyc/certificate`.
+3. `POST /providers/kyc/submit` -> `pending`. An admin uses `/admin/kyc/queue`, `/admin/kyc/:id` and
+   `/admin/kyc/:id/decision`; the partner gets `partner:kyc` on the socket and a notification.
+4. Only `approved` partners can go online (database rule `online_requires_kyc`).
+
+`KYC_PROVIDER` picks the checks: `manual` (default, everything reviewed by a person), `fake` (simulated, for
+development; it serves its own DigiLocker test page) or `cashfree` (Cashfree Secure ID; set `CASHFREE_*`,
+`PUBLIC_API_URL` and `KYC_HASH_PEPPER`). Stored: verified name, date of birth, city, last 4 digits of Aadhaar
+and of the account, salted hashes for duplicate checks. Never stored: full Aadhaar or account numbers,
+Aadhaar XML. Photos sit in the private `kyc` bucket and admins only get 5-minute links.
+
+To make someone an admin: `update users set is_admin = true where id = '<firebase uid>';`
 
 ## How a booking flows
 

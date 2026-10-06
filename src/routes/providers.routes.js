@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import * as c from '../controllers/providers.controller.js';
+import { getKyc } from '../controllers/kyc.controller.js';
 import { authenticate, requirePartner } from '../middleware/auth.js';
 import { writeLimiter } from '../middleware/rateLimiter.js';
 import { notImplemented } from '../utils/errors.js';
@@ -61,13 +62,13 @@ const updateBody = z.object({ ...profileShape, categorySlugs: categorySlugs.opti
 // Partner self-service. Registered before /:id so "me" is never a partner id.
 router.post('/register', writeLimiter, validate({ body: registerBody }), asyncHandler(c.register));
 router.get('/me', requirePartner, asyncHandler(c.getMe));
+router.get('/me/kyc', requirePartner, asyncHandler(getKyc));
 router.patch('/me', requirePartner, writeLimiter, validate({ body: updateBody }), asyncHandler(c.updateMe));
 router.patch('/profile', requirePartner, writeLimiter, validate({ body: updateBody }), asyncHandler(c.updateMe)); // v1 alias
 router.post('/skills', requirePartner, writeLimiter, validate({ body: updateBody }), asyncHandler(c.updateMe)); // v1 alias
 
-// KYC upload, dashboard and earnings ship in Backend Phase 6.
+// Verification lives in kyc.routes.js. Dashboard and earnings ship in Backend Phase 6.
 const later = (feature) => (_req, _res, next) => next(notImplemented(feature, 6));
-router.post('/kyc', requirePartner, later('KYC upload'));
 router.get('/earnings', requirePartner, later('Partner earnings'));
 router.get('/me/dashboard', requirePartner, later('Partner dashboard'));
 

@@ -66,6 +66,29 @@ const schema = z
     MAX_ACTIVE_BOOKINGS: z.coerce.number().int().min(1).max(20).default(3),
     MAX_SCHEDULE_DAYS: z.coerce.number().int().min(1).max(60).default(14),
 
+    // Partner verification (KYC).
+    //   manual   : no automatic checks; DigiLocker hidden, selfie and bank go to admin review (default)
+    //   fake     : simulated DigiLocker / face / bank checks for development and testing
+    //   cashfree : Cashfree Secure ID (DigiLocker, face match + liveness, bank account check)
+    KYC_PROVIDER: z.enum(['manual', 'fake', 'cashfree']).default('manual'),
+    KYC_ALLOW_FAKE_IN_PRODUCTION: bool(false),
+    // Secret mixed into ID and bank-account hashes (duplicate-account checks). Set it before the
+    // first partner verifies and never change it. Unset: derived from the service-role key (warns at start).
+    KYC_HASH_PEPPER: z.string().min(32).optional(),
+    // Public https origin of this API, used for the DigiLocker return page (e.g. https://api.serwish.in).
+    PUBLIC_API_URL: z.string().url().optional(),
+    KYC_FACE_MATCH_THRESHOLD: z.coerce.number().min(0.5).max(0.99).default(0.75),
+    KYC_NAME_MATCH_MIN: z.coerce.number().min(0).max(100).default(70),
+    // Category slugs whose partners must upload a skill certificate (e.g. electrician,gas-stove).
+    KYC_CERT_REQUIRED_CATEGORIES: list,
+    CASHFREE_ENV: z.enum(['sandbox', 'production']).default('sandbox'),
+    CASHFREE_CLIENT_ID: z.string().optional(),
+    CASHFREE_CLIENT_SECRET: z.string().optional(),
+    CASHFREE_API_VERSION: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .default('2024-12-01'),
+
     // Feature switches. Online payments (Razorpay) ship in Backend Phase 5.
     FEATURE_BOOKINGS: bool(true),
     FEATURE_PAYMENTS: bool(false),
@@ -80,6 +103,20 @@ const schema = z
         path: ['FIREBASE_SERVICE_ACCOUNT_JSON'],
         message:
           'Firebase Admin credentials are missing. Set FIREBASE_SERVICE_ACCOUNT_JSON, GOOGLE_APPLICATION_CREDENTIALS, or the three FIREBASE_* variables.',
+      });
+    }
+    if (v.KYC_PROVIDER === 'cashfree' && !(v.CASHFREE_CLIENT_ID && v.CASHFREE_CLIENT_SECRET)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['CASHFREE_CLIENT_ID'],
+        message: 'KYC_PROVIDER=cashfree needs CASHFREE_CLIENT_ID and CASHFREE_CLIENT_SECRET.',
+      });
+    }
+    if (v.NODE_ENV === 'production' && v.KYC_PROVIDER === 'fake' && !v.KYC_ALLOW_FAKE_IN_PRODUCTION) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['KYC_PROVIDER'],
+        message: 'KYC_PROVIDER=fake approves anyone. Set KYC_ALLOW_FAKE_IN_PRODUCTION=true only on a test server.',
       });
     }
     if (v.NODE_ENV === 'production' && v.ALLOWED_ORIGINS.includes('*')) {

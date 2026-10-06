@@ -57,5 +57,6 @@ export const SOCKET_EVENTS = Object.freeze({
   JOB_OFFER: 'job:offer',
   JOB_OFFER_CLOSED: 'job:offer_closed',
   NOTIFICATION_NEW: 'notification:new',
+  PARTNER_KYC: 'partner:kyc',
   ERROR: 'error:event',
 });

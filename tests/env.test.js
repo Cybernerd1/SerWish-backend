@@ -39,6 +39,20 @@ describe('env', () => {
     ]);
   });
 
+  it('guards the KYC provider settings', () => {
+    expect(parseEnv(base).KYC_PROVIDER).toBe('manual');
+    expect(() => parseEnv({ ...base, KYC_PROVIDER: 'cashfree' })).toThrow(/CASHFREE_CLIENT_ID/);
+    expect(
+      parseEnv({ ...base, KYC_PROVIDER: 'cashfree', CASHFREE_CLIENT_ID: 'id', CASHFREE_CLIENT_SECRET: 's' })
+        .CASHFREE_ENV,
+    ).toBe('sandbox');
+    expect(() => parseEnv({ ...base, KYC_PROVIDER: 'fake' })).toThrow(/KYC_ALLOW_FAKE_IN_PRODUCTION/);
+    expect(parseEnv({ ...base, KYC_PROVIDER: 'fake', NODE_ENV: 'development' }).KYC_PROVIDER).toBe('fake');
+    expect(
+      parseEnv({ ...base, KYC_CERT_REQUIRED_CATEGORIES: 'electrician, gas-stove' }).KYC_CERT_REQUIRED_CATEGORIES,
+    ).toEqual(['electrician', 'gas-stove']);
+  });
+
   it('validates numeric ranges', () => {
     expect(() => parseEnv({ ...base, MATCH_RADIUS_KM: '500' })).toThrow(/MATCH_RADIUS_KM/);
     expect(parseEnv({ ...base, JOB_OFFER_SECONDS: '60' }).JOB_OFFER_SECONDS).toBe(60);
